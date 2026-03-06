@@ -132,7 +132,7 @@ class BaseWorker:
 
         self.llm = ChatOpenAI(
             model=model,
-            base_url=None,
+            base_url=os.environ.get("LLM_BASE_URL"),
             api_key=os.environ["LLM_API_KEY"],
             use_responses_api=True,
             reasoning={

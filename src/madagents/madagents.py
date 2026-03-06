@@ -479,7 +479,7 @@ class MadAgents:
         plan_updater_cfg = config.agents["plan_updater"]
         self.plan_updater_llm = ChatOpenAI(
             model=plan_updater_cfg.model,
-            base_url=None,
+            base_url=os.environ.get("LLM_BASE_URL"),
             api_key=os.environ["LLM_API_KEY"],
             use_responses_api=True,
             reasoning={
