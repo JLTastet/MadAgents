@@ -51,7 +51,7 @@ export default function CostDetailsModal({ open, onClose, theme, runDetails }) {
       style={{
         position: "fixed",
         inset: 0,
-        zIndex: 60,
+        zIndex: 61,
         background: "rgba(15, 23, 42, 0.45)",
         display: "flex",
         alignItems: "center",

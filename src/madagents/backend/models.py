@@ -12,6 +12,7 @@ class RunInfo(BaseModel):
     last_updated_at: str
     workdir: str
     name: Optional[str] = None
+    version: Optional[str] = None
 
 
 class CostBreakdown(BaseModel):

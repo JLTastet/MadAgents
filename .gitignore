@@ -14,3 +14,11 @@ output/
 *.sif
 *.img
 config.env
+.claude/
+claude_code/.config/
+claude_code/archive
+!claude_code/.claude
+!claude_code/.claude/settings.local.json
+!claude_code/CLAUDE.md
+.nfs*
+archive/

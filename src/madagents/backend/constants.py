@@ -9,16 +9,16 @@ BASE_WORKER_AGENTS = {
     "madgraph_operator",
     "plotter",
     "user_cli_operator",
+    "physics_expert",
 }
 
-REVIEWER_AGENT = "reviewer"
+REVIEWER_AGENTS = {"plan_reviewer", "verification_reviewer", "presentation_reviewer"}
 
 KNOWN_AGENT_NAMES = BASE_WORKER_AGENTS | {
     "planner",
     "plan_updater",
-    REVIEWER_AGENT,
     "orchestrator",
-}
+} | REVIEWER_AGENTS
 
 INTERRUPT_USER_MESSAGE = "I interrupt the workflow."
 

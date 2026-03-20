@@ -83,11 +83,13 @@ export const renderPlanLabel = (plan, theme, label = "Plan") => {
   );
 };
 
-export const renderPlanUpdateLabel = (steps, theme) => {
-  const stats = getPlanStats({ steps: Array.isArray(steps) ? steps : [] });
+export const renderPlanUpdateLabel = (steps, theme, plan) => {
+  const stats = plan
+    ? getPlanStats(plan)
+    : getPlanStats({ steps: Array.isArray(steps) ? steps : [] });
   const statusItems = renderPlanStatusItems(stats, theme, {
-    showTotal: false,
-    omitZero: true,
+    showTotal: true,
+    omitZero: false,
   });
 
   return (

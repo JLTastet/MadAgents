@@ -24,7 +24,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 
 from madagents.madagents import MadAgents
 from madagents.config import coerce_config
-from madagents.cli_bridge.bridge_handle import InstanceHandle, start_bridge, stop_bridge
+from madagents.cli_bridge.bridge_handle import InstanceHandle, stop_bridge
 from madagents.utils import response_to_text, save_state_atomic
 
 from madagents.backend.constants import (
@@ -32,7 +32,7 @@ from madagents.backend.constants import (
     CHECKPOINTS_DB_PATH,
     INTERRUPT_USER_MESSAGE,
     KNOWN_AGENT_NAMES,
-    REVIEWER_AGENT,
+    REVIEWER_AGENTS,
     RUNS_DB_PATH,
 )
 from madagents.backend.db import (
@@ -61,8 +61,10 @@ from madagents.backend.messages import (
     _merge_mapping,
     _message_to_ui,
     _update_pending_tool_calls,
+    find_unmatched_tool_calls,
     get_add_content,
     get_exec_trace_messages,
+    synthesize_interrupt_tool_messages,
 )
 from madagents.backend.models import (
     ActiveRunResponse,
@@ -354,11 +356,11 @@ def create_app(
         if run_info is None:
             raise HTTPException(status_code=404, detail="Run not found")
 
-        if app.state.madgraph_handle is not None:
-            stop_bridge(app.state.madgraph_handle)
         if app.state.agent is not None:
             app.state.agent.close()
             app.state.agent = None
+        elif app.state.madgraph_handle is not None:
+            stop_bridge(app.state.madgraph_handle)
         app.state.thread_id = thread_id
         app.state.workdir = run_info.workdir
 
@@ -375,21 +377,25 @@ def create_app(
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
 
-        app.state.madgraph_handle = start_bridge(
-            name="madgraph_cli",
-            dir=os.path.join(workdir, "madgraph_bridge"),
-            cli_cmd="bash",
-        )
+        madgraph_bridge_dir = os.path.join(workdir, "madgraph_bridge")
+        app.state.madgraph_handle = None  # no longer eagerly started
 
         checkpoint_db = ensure_checkpoint_migrated(thread_id)
         app.state.active_checkpoint_db = checkpoint_db
         app.state.active_checkpointer = select_checkpointer(checkpoint_db)
         app.state.agent = MadAgents(
-            madgraph_handle=app.state.madgraph_handle,
+            madgraph_bridge_dir=madgraph_bridge_dir,
             user_handle=app.state.user_handle,
             checkpointer=app.state.active_checkpointer,
             config=app.state.global_config,
         )
+
+        # Repair any unmatched tool calls left by interrupted/crashed runs
+        # before extracting history so the checkpoint is clean for resume.
+        if not new_run:
+            await _repair_checkpoint_tool_calls(
+                app.state.agent.graph, thread_id,
+            )
 
         keep_live_cache = (
             not new_run
@@ -472,15 +478,16 @@ def create_app(
         interrupted = False
         interrupt_reason: Optional[tuple[str, Optional[str]]] = None
         current_namespace: tuple = ()
-        last_subgraph_agent: Optional[str] = None
-        last_subgraph_messages: list[BaseMessage] = []
-        last_subgraph_summary: Optional[str] = None
-        last_subgraph_summary_set = False
-        last_subgraph_non_summary_start: Optional[int] = None
-        last_subgraph_non_summary_start_set = False
+        # Per-agent subgraph tracking for parallel subgraphs
+        subgraph_tracking: dict[str, dict] = {}
+        # Each entry: { "messages": [], "last_msg_index": 0,
+        #               "summary": None, "summary_set": False,
+        #               "non_summary_start": None, "non_summary_start_set": False }
+        last_subgraph_agent: Optional[str] = None  # most recently seen agent (for interrupt fallback)
         pending_tool_calls: dict[str, dict] = {}
         pending_apply_patch_calls: dict[str, dict] = {}
-        pending_recipient: Optional[str] = None
+        pending_recipients: dict[str, int] = {}
+        dispatch_instance_ids: dict[str, int] = {}  # agent_name -> instance_id from current dispatch
 
         if new_run:
             run_info = get_run_info(app.state.runs_db, thread_id)
@@ -523,20 +530,24 @@ def create_app(
             def resolve_interrupt_fallback_agent() -> Optional[str]:
                 for call in pending_tool_calls.values():
                     agent = _normalize_agent_name(call.get("agent"))
-                    if agent in BASE_WORKER_AGENTS or agent == REVIEWER_AGENT:
+                    if agent in BASE_WORKER_AGENTS or agent in REVIEWER_AGENTS:
                         return agent
                 for call in pending_apply_patch_calls.values():
                     agent = _normalize_agent_name(call.get("agent"))
-                    if agent in BASE_WORKER_AGENTS or agent == REVIEWER_AGENT:
+                    if agent in BASE_WORKER_AGENTS or agent in REVIEWER_AGENTS:
                         return agent
                 normalized_last_subgraph_agent = _normalize_agent_name(last_subgraph_agent)
-                if normalized_last_subgraph_agent in BASE_WORKER_AGENTS or normalized_last_subgraph_agent == REVIEWER_AGENT:
+                if normalized_last_subgraph_agent in BASE_WORKER_AGENTS or normalized_last_subgraph_agent in REVIEWER_AGENTS:
                     return normalized_last_subgraph_agent
                 return None
 
             fallback_agent = resolve_interrupt_fallback_agent()
             if fallback_agent is None:
-                fallback_agent = _normalize_agent_name(pending_recipient)
+                # Pick first pending recipient as fallback
+                for _pr in pending_recipients:
+                    fallback_agent = _normalize_agent_name(_pr)
+                    if fallback_agent:
+                        break
 
             def add_synthetic_tool_message(
                 agent_name: Optional[str],
@@ -546,7 +557,7 @@ def create_app(
                 resolved_agent = _normalize_agent_name(resolved_agent)
                 if resolved_agent is None:
                     resolved_agent = fallback_agent
-                if resolved_agent in BASE_WORKER_AGENTS or resolved_agent == REVIEWER_AGENT:
+                if resolved_agent in BASE_WORKER_AGENTS or resolved_agent in REVIEWER_AGENTS:
                     synthetic_agent_messages.setdefault(resolved_agent, []).append(tool_msg)
                     ui_agent = resolved_agent
                 else:
@@ -633,88 +644,212 @@ def create_app(
             except Exception as exc:
                 print(f"Could not load checkpoint for thread {thread_id}: {exc}")
 
-            agent_name = last_subgraph_agent if current_namespace != () else None
-            if agent_name is None:
-                agent_name = fallback_agent
-            interrupt_messages: list[BaseMessage] = []
+            # Determine which agents to interrupt.
+            # In parallel mode, multiple agents may be active in subgraph_tracking.
+            # Fall back to the most recent subgraph agent or the fallback.
+            active_agents: list[str] = []
+            if subgraph_tracking and current_namespace != ():
+                active_agents = list(subgraph_tracking.keys())
+            elif last_subgraph_agent and current_namespace != ():
+                active_agents = [last_subgraph_agent]
+            if not active_agents and fallback_agent:
+                active_agents = [fallback_agent]
+
+            # Find unmatched orchestrator tool calls early — needed both for
+            # synthesizing interrupt ToolMessages and for filtering completed
+            # dispatches out of interrupt_items.
             update: dict[str, Any] = {}
-
-            # Orchestrator interrupts should not emit a synthetic AIMessage; UI still gets the user interrupt/tool traces.
-            skip_interrupt_ai = agent_name == "orchestrator"
-            if agent_name and not skip_interrupt_ai:
-                additional_kwargs: dict[str, Any] = {}
-                message_id: Optional[str] = None
-                if agent_name in BASE_WORKER_AGENTS or agent_name in {"planner", REVIEWER_AGENT, "orchestrator"}:
-                    message_id = uuid.uuid4().hex
-                    additional_kwargs["message_id"] = message_id
-                if agent_name in {"planner", "plan_updater"}:
-                    plan = values.get("plan") or []
-                    additional_kwargs["plan"] = plan
-                    plan_meta_data = values.get("plan_meta_data")
-                    if plan_meta_data is not None:
-                        additional_kwargs["plan_meta_data"] = plan_meta_data
-                elif agent_name == "orchestrator":
-                    # Avoid reusing a stale orchestrator decision on interrupt.
-                    additional_kwargs["orchestrator_decision"] = {}
-
-                interrupt_ai = _build_interrupt_ai_message(
-                    agent_name=agent_name,
-                    reason_type=reason_type,
-                    detail=reason_detail,
-                    additional_kwargs=additional_kwargs,
+            orch_msgs = values.get("orchestrator_messages", [])
+            unmatched_orch = find_unmatched_tool_calls(orch_msgs)
+            if unmatched_orch:
+                update["orchestrator_messages"] = synthesize_interrupt_tool_messages(
+                    unmatched_orch, reason=tool_reason,
                 )
-                interrupt_messages.append(interrupt_ai)
 
-                if agent_name in BASE_WORKER_AGENTS or agent_name == REVIEWER_AGENT:
-                    batch: list[BaseMessage] = []
-                    agent_synthetic = synthetic_agent_messages.pop(agent_name, [])
-                    user_msg = None
-                    orchestrator_decision = values.get("orchestrator_decision")
-                    if isinstance(orchestrator_decision, dict):
-                        user_text = orchestrator_decision.get("message")
-                        if isinstance(user_text, str) and user_text:
-                            user_msg = HumanMessage(content=user_text)
-                    if user_msg is not None:
-                        batch.append(user_msg)
-                    if last_subgraph_messages:
-                        batch.extend(last_subgraph_messages)
-                    if agent_synthetic:
-                        batch.extend(agent_synthetic)
-                    batch.append(interrupt_ai)
+            # Build per-instance interrupt items
+            interrupt_items: list[tuple[str, Optional[dict]]] = []
+            orchestrator_dispatches_list = values.get("orchestrator_dispatches") or []
+            unmatched_tool_call_ids = set(unmatched_orch.keys()) if unmatched_orch else set()
+
+            # Filter active_agents: subgraph_tracking retains entries from ALL
+            # agents that ever emitted subgraph events (including those that
+            # already completed in prior dispatches).  Only keep agents whose
+            # orchestrator dispatch is still unmatched.
+            if active_agents and orchestrator_dispatches_list:
+                unmatched_recipients = set()
+                for d in orchestrator_dispatches_list:
+                    if isinstance(d, dict):
+                        tc_id = d.get("tool_call_id")
+                        r = d.get("recipient", "")
+                        if r and tc_id and tc_id in unmatched_tool_call_ids:
+                            unmatched_recipients.add(r)
+                active_agents = [a for a in active_agents if a in unmatched_recipients]
+
+            # Collect per-instance dispatches for workers/reviewers that
+            # haven't completed yet.  Dispatches whose tool_call_id is already
+            # matched (worker returned its ToolMessage) are excluded — those
+            # workers finished normally before the interrupt.
+            worker_reviewer_dispatches: list[dict] = []
+            for d in orchestrator_dispatches_list:
+                if isinstance(d, dict):
+                    r = d.get("recipient", "")
+                    if r in BASE_WORKER_AGENTS or r in REVIEWER_AGENTS:
+                        tc_id = d.get("tool_call_id")
+                        if tc_id and tc_id in unmatched_tool_call_ids:
+                            worker_reviewer_dispatches.append(d)
+
+            dispatch_covered_agents: set[str] = {
+                d.get("recipient", "") for d in worker_reviewer_dispatches
+            }
+
+            # Non-worker/reviewer agents from active_agents (dispatch=None)
+            for agent_name in active_agents:
+                if agent_name not in dispatch_covered_agents:
+                    interrupt_items.append((agent_name, None))
+
+            # One item per worker/reviewer dispatch (with instance info)
+            for d in worker_reviewer_dispatches:
+                interrupt_items.append((d.get("recipient", ""), d))
+
+            # If all dispatches completed but the orchestrator hasn't
+            # responded yet, the interrupt happened between worker completion
+            # and orchestrator output.  Emit an orchestrator interrupt message
+            # so the UI shows the interruption clearly.
+            if not interrupt_items and orchestrator_dispatches_list:
+                interrupt_items.append(("orchestrator", None))
+            elif not interrupt_items and fallback_agent:
+                interrupt_items.append((fallback_agent, None))
+
+            # Build dispatch lookup for reconstructing user_msg per agent.
+            # Store both composite key (recipient:instance_id) for future
+            # instance-aware tracking, and bare recipient name as fallback
+            # (last dispatch wins when multiple instances share a name).
+            dispatches_by_recipient: dict[str, dict] = {}
+            for d in orchestrator_dispatches_list:
+                if isinstance(d, dict):
+                    recipient = d.get("recipient", "")
+                    iid = d.get("instance_id")
+                    if iid is not None:
+                        dispatches_by_recipient[f"{recipient}:{iid}"] = d
+                    dispatches_by_recipient[recipient] = d
+            # Fallback to single orchestrator_decision
+            if not dispatches_by_recipient:
+                od = values.get("orchestrator_decision")
+                if isinstance(od, dict) and od.get("recipient"):
+                    dispatches_by_recipient[od["recipient"]] = od
+
+            interrupt_messages: list[BaseMessage] = []
+            agents_messages_update: dict[str, dict] = {}
+            agent_instance_map_update: dict[str, dict[str, list[str]]] = {}
+            agents_summary_update: dict[str, Any] = {}
+            agents_non_summary_update: dict[str, Any] = {}
+
+            for agent_name, agent_dispatch_item in interrupt_items:
+                tracking = subgraph_tracking.get(agent_name, {})
+                agent_msgs = tracking.get("messages", [])
+                agent_summary = tracking.get("summary")
+                agent_summary_set = tracking.get("summary_set", False)
+                agent_non_summary_start = tracking.get("non_summary_start")
+                agent_non_summary_start_set = tracking.get("non_summary_start_set", False)
+
+                if agent_name:
+                    additional_kwargs: dict[str, Any] = {}
+                    message_id: Optional[str] = None
+                    if agent_name in BASE_WORKER_AGENTS or agent_name in {"planner", "orchestrator"} or agent_name in REVIEWER_AGENTS:
+                        message_id = uuid.uuid4().hex
+                        additional_kwargs["message_id"] = message_id
+                    if agent_dispatch_item is not None:
+                        dispatch_iid = agent_dispatch_item.get("instance_id")
+                        if dispatch_iid is not None:
+                            additional_kwargs["instance_id"] = dispatch_iid
+                    if agent_name in {"planner", "plan_updater"}:
+                        plan = values.get("plan") or []
+                        additional_kwargs["plan"] = plan
+                        plan_meta_data = values.get("plan_meta_data")
+                        if plan_meta_data is not None:
+                            additional_kwargs["plan_meta_data"] = plan_meta_data
+
+                    interrupt_ai = _build_interrupt_ai_message(
+                        agent_name=agent_name,
+                        reason_type=reason_type,
+                        detail=reason_detail,
+                        additional_kwargs=additional_kwargs,
+                    )
+                    interrupt_messages.append(interrupt_ai)
+
+                    if agent_name in BASE_WORKER_AGENTS or agent_name in REVIEWER_AGENTS:
+                        batch: list[BaseMessage] = []
+                        agent_synthetic = synthetic_agent_messages.pop(agent_name, [])
+                        user_msg = None
+                        if agent_dispatch_item is not None:
+                            user_text = agent_dispatch_item.get("message")
+                            if isinstance(user_text, str) and user_text:
+                                user_msg = HumanMessage(content=user_text)
+                        else:
+                            # Backward compat: no dispatch item, use dispatches_by_recipient
+                            dispatch_iid = tracking.get("instance_id")
+                            agent_dispatch = (
+                                dispatches_by_recipient.get(f"{agent_name}:{dispatch_iid}")
+                                if dispatch_iid is not None else None
+                            ) or dispatches_by_recipient.get(agent_name)
+                            if isinstance(agent_dispatch, dict):
+                                user_text = agent_dispatch.get("message")
+                                if isinstance(user_text, str) and user_text:
+                                    user_msg = HumanMessage(content=user_text)
+                        if user_msg is None:
+                            orchestrator_decision = values.get("orchestrator_decision")
+                            if isinstance(orchestrator_decision, dict):
+                                user_text = orchestrator_decision.get("message")
+                                if isinstance(user_text, str) and user_text:
+                                    user_msg = HumanMessage(content=user_text)
+                        if user_msg is not None:
+                            batch.append(user_msg)
+                        if agent_msgs:
+                            batch.extend(agent_msgs)
+                        if agent_synthetic:
+                            batch.extend(agent_synthetic)
+                        batch.append(interrupt_ai)
+                        if message_id:
+                            agents_messages_update.setdefault(agent_name, {}).update({message_id: batch})
+                            # Register this batch under the correct instance so
+                            # the worker sees interrupt context on follow-up.
+                            iid = (agent_dispatch_item or {}).get("instance_id", 0)
+                            agent_instance_map_update.setdefault(agent_name, {})[str(iid)] = [message_id]
+
+                    if agent_name in BASE_WORKER_AGENTS:
+                        if agent_summary_set:
+                            agents_summary_update[agent_name] = agent_summary
+                        if agent_non_summary_start_set:
+                            agents_non_summary_update[agent_name] = agent_non_summary_start
+
                     if message_id:
-                        update["agents_messages"] = {agent_name: {message_id: batch}}
+                        if agent_name == "planner":
+                            update["planner_full_messages"] = {message_id: interrupt_ai}
+                        elif agent_name in REVIEWER_AGENTS:
+                            update.setdefault("reviewer_full_messages", {}).update({message_id: interrupt_ai})
+                        elif agent_name == "orchestrator":
+                            update["orchestrator_full_messages"] = {message_id: interrupt_ai}
 
-                if agent_name in BASE_WORKER_AGENTS:
-                    if last_subgraph_summary_set:
-                        update["agents_message_summary"] = _merge_mapping(
-                            values.get("agents_message_summary"),
-                            {agent_name: last_subgraph_summary},
-                        )
-                    if last_subgraph_non_summary_start_set:
-                        update["agents_non_summary_start"] = _merge_mapping(
-                            values.get("agents_non_summary_start"),
-                            {agent_name: last_subgraph_non_summary_start},
-                        )
+                    if agent_name in {"planner", "orchestrator"} or agent_name in REVIEWER_AGENTS:
+                        if agent_summary_set:
+                            update["message_summary"] = agent_summary
+                        if agent_non_summary_start_set:
+                            update["non_summary_start"] = agent_non_summary_start
 
-                if message_id:
-                    if agent_name == "planner":
-                        update["planner_full_messages"] = {message_id: interrupt_ai}
-                    elif agent_name == REVIEWER_AGENT:
-                        update["reviewer_full_messages"] = {message_id: interrupt_ai}
-                    elif agent_name == "orchestrator":
-                        update["orchestrator_full_messages"] = {message_id: interrupt_ai}
-
-                if agent_name in {"planner", REVIEWER_AGENT, "orchestrator"}:
-                    if last_subgraph_summary_set:
-                        update["message_summary"] = last_subgraph_summary
-                    if last_subgraph_non_summary_start_set:
-                        update["non_summary_start"] = last_subgraph_non_summary_start
-
-            if agent_name and skip_interrupt_ai:
-                if last_subgraph_summary_set:
-                    update["message_summary"] = last_subgraph_summary
-                if last_subgraph_non_summary_start_set:
-                    update["non_summary_start"] = last_subgraph_non_summary_start
+            if agents_messages_update:
+                update["agents_messages"] = agents_messages_update
+            if agent_instance_map_update:
+                update["agent_instance_map"] = agent_instance_map_update
+            if agents_summary_update:
+                update["agents_message_summary"] = _merge_mapping(
+                    values.get("agents_message_summary"),
+                    agents_summary_update,
+                )
+            if agents_non_summary_update:
+                update["agents_non_summary_start"] = _merge_mapping(
+                    values.get("agents_non_summary_start"),
+                    agents_non_summary_update,
+                )
 
             interrupt_messages.append(HumanMessage(content=INTERRUPT_USER_MESSAGE))
             if synthetic_root_messages:
@@ -738,8 +873,6 @@ def create_app(
 
         async_gen = None
         try:
-            subgraph_last_msg_index = 0
-
             async_gen = agent.graph.astream(
                 state, config=run_config, stream_mode="values", subgraphs=True
             )
@@ -774,30 +907,78 @@ def create_app(
                             if getattr(msg, "name", None) == "orchestrator":
                                 additional_kwargs = getattr(msg, "additional_kwargs", None)
                                 if isinstance(additional_kwargs, dict):
-                                    decision = additional_kwargs.get("orchestrator_decision")
-                                    if isinstance(decision, dict):
-                                        recipient = decision.get("recipient")
-                                        if recipient in BASE_WORKER_AGENTS or recipient in {"planner", "plan_updater", REVIEWER_AGENT}:
-                                            pending_recipient = recipient
-                            elif pending_recipient and getattr(msg, "name", None) == pending_recipient:
-                                pending_recipient = None
-                    new_messages = [
-                        {
+                                    # v1.1 multi-dispatch
+                                    dispatches = additional_kwargs.get("orchestrator_dispatches")
+                                    if isinstance(dispatches, list):
+                                        for d in dispatches:
+                                            if isinstance(d, dict):
+                                                r = d.get("recipient")
+                                                if r in BASE_WORKER_AGENTS or r in {"planner", "plan_updater"} or r in REVIEWER_AGENTS:
+                                                    pending_recipients[r] = pending_recipients.get(r, 0) + 1
+                                                iid = d.get("instance_id")
+                                                if r and iid is not None:
+                                                    dispatch_instance_ids[r] = iid
+                                    else:
+                                        # v1.0 / v1.1 single-dispatch
+                                        decision = additional_kwargs.get("orchestrator_decision")
+                                        if isinstance(decision, dict):
+                                            recipient = decision.get("recipient")
+                                            if recipient in BASE_WORKER_AGENTS or recipient in {"planner", "plan_updater"} or recipient in REVIEWER_AGENTS:
+                                                pending_recipients[recipient] = pending_recipients.get(recipient, 0) + 1
+                            else:
+                                msg_name = getattr(msg, "name", None)
+                                if msg_name and pending_recipients.get(msg_name, 0) > 0:
+                                    pending_recipients[msg_name] -= 1
+                                    if pending_recipients[msg_name] <= 0:
+                                        del pending_recipients[msg_name]
+                    # Inject exec traces from agents_messages for agent
+                    # display messages.  Worker/planner/reviewer nodes are
+                    # function nodes that call .invoke() synchronously, so
+                    # subgraph streaming events are not emitted.  We pull
+                    # exec traces from the state snapshot instead.
+                    agents_messages_snapshot = update.get("agents_messages") or {}
+                    ui_messages: list[dict] = []
+                    for i, msg in enumerate(new_messages):
+                        msg_name = getattr(msg, "name", None)
+                        # Inject exec traces before agent display messages
+                        if (
+                            msg_name
+                            and msg_name not in {"user", "orchestrator"}
+                            and not isinstance(msg, HumanMessage)
+                        ):
+                            ak = getattr(msg, "additional_kwargs", None)
+                            mid = ak.get("message_id") if isinstance(ak, dict) else None
+                            already_streamed = (
+                                msg_name in subgraph_tracking
+                                and subgraph_tracking[msg_name].get("last_msg_index", 0) > 0
+                            )
+                            if mid and not already_streamed:
+                                batches = agents_messages_snapshot.get(msg_name)
+                                if isinstance(batches, dict):
+                                    batch = batches.get(mid)
+                                    if batch:
+                                        trace_instance_id = ak.get("instance_id") if isinstance(ak, dict) else None
+                                        for sub_msg in batch:
+                                            if isinstance(sub_msg, HumanMessage):
+                                                continue
+                                            traces = get_exec_trace_messages(msg_name, sub_msg)
+                                            if trace_instance_id is not None:
+                                                for t in traces:
+                                                    if isinstance(t, dict) and isinstance(t.get("add_content"), dict):
+                                                        t["add_content"]["instance_id"] = trace_instance_id
+                                            ui_messages.extend(traces)
+                        ui_msg: dict = {
                             "content": response_to_text(msg),
                             "name": msg.name,
                             "add_content": get_add_content(msg),
                             "message_index": start_index + i,
-                            **(
-                                {
-                                    "can_rewind_before": (start_index + i)
-                                    in rewindable_indices
-                                }
-                                if isinstance(msg, HumanMessage)
-                                else {}
-                            ),
                         }
-                        for i, msg in enumerate(new_messages)
-                    ]
+                        if isinstance(msg, HumanMessage):
+                            ui_msg["can_rewind_before"] = (
+                                (start_index + i) in rewindable_indices
+                            )
+                        ui_messages.append(ui_msg)
+                    new_messages = ui_messages
                     _append_thread_ui_messages(thread_id, new_messages)
                     thread_last_msg_index = len(messages)
                     _set_thread_message_index(thread_id, thread_last_msg_index)
@@ -812,27 +993,42 @@ def create_app(
                         os.path.join("/runs/workdirs", app.state.workdir, "logs/state.json"),
                     )
                 else:
-                    last_subgraph_agent = _normalize_agent_name(namespace[0])
-                    if pending_recipient == last_subgraph_agent:
-                        pending_recipient = None
+                    agent_name = _normalize_agent_name(namespace[0])
+                    last_subgraph_agent = agent_name
+                    if pending_recipients.get(agent_name, 0) > 0:
+                        pending_recipients[agent_name] -= 1
+                        if pending_recipients[agent_name] <= 0:
+                            del pending_recipients[agent_name]
+                    # Get or create per-agent tracking entry
+                    if agent_name not in subgraph_tracking:
+                        subgraph_tracking[agent_name] = {
+                            "messages": [],
+                            "last_msg_index": 0,
+                            "summary": None,
+                            "summary_set": False,
+                            "non_summary_start": None,
+                            "non_summary_start_set": False,
+                        }
+                    tracking = subgraph_tracking[agent_name]
                     messages = update["messages"]
-                    last_subgraph_messages = messages
-                    raw_new_messages = messages[subgraph_last_msg_index:]
+                    tracking["messages"] = messages
+                    agent_last_msg_index = tracking["last_msg_index"]
+                    raw_new_messages = messages[agent_last_msg_index:]
                     if raw_new_messages:
                         _update_pending_tool_calls(
                             raw_new_messages,
-                            last_subgraph_agent,
+                            agent_name,
                             pending_tool_calls,
                             pending_apply_patch_calls,
                         )
                     summary, summary_set, non_summary_start, non_summary_set = _extract_subgraph_summary_fields(update)
                     if summary_set:
-                        last_subgraph_summary = summary
-                        last_subgraph_summary_set = True
+                        tracking["summary"] = summary
+                        tracking["summary_set"] = True
                     if non_summary_set:
-                        last_subgraph_non_summary_start = non_summary_start
-                        last_subgraph_non_summary_start_set = True
-                    new_messages = messages[subgraph_last_msg_index:]
+                        tracking["non_summary_start"] = non_summary_start
+                        tracking["non_summary_start_set"] = True
+                    new_messages = messages[agent_last_msg_index:]
                     new_messages = [
                         msg
                         for msg in new_messages
@@ -841,10 +1037,16 @@ def create_app(
                     new_messages = [
                         exec_trace
                         for msg in new_messages
-                        for exec_trace in get_exec_trace_messages(namespace[0], msg)
+                        for exec_trace in get_exec_trace_messages(agent_name, msg)
                     ]
+                    # Inject instance_id from dispatch context into subgraph traces
+                    trace_iid = dispatch_instance_ids.get(agent_name)
+                    if trace_iid is not None:
+                        for t in new_messages:
+                            if isinstance(t, dict) and isinstance(t.get("add_content"), dict):
+                                t["add_content"]["instance_id"] = trace_iid
                     _append_thread_ui_messages(thread_id, new_messages)
-                    subgraph_last_msg_index = len(messages)
+                    tracking["last_msg_index"] = len(messages)
                     payload = {
                         "event": "message_update",
                         "messages": new_messages,
@@ -874,7 +1076,7 @@ def create_app(
                 try:
                     await async_gen.aclose()
                 except Exception:
-                    pass
+                    traceback.print_exc()
             if interrupt_reason is not None:
                 try:
                     await apply_interrupt_updates()
@@ -920,6 +1122,7 @@ def create_app(
             try:
                 await app.state.active_run_task
             except HTTPException as exc:
+                print(f"[chat_worker] HTTP error for {thread_id}: {exc.detail}")
                 await append_event(
                     thread_id,
                     {"event": "error", "error": exc.detail},
@@ -937,6 +1140,16 @@ def create_app(
                 await _refresh_rewind_scans()
                 await emit_active_state_if_changed()
                 app.state.chat_queue.task_done()
+                # Clean up event buffers for threads that are no longer
+                # active or being viewed to prevent unbounded memory growth.
+                stale = [
+                    tid for tid in app.state.event_buffers
+                    if tid != ACTIVE_EVENT_KEY
+                    and tid != app.state.viewed_thread_id
+                ]
+                for tid in stale:
+                    app.state.event_buffers.pop(tid, None)
+                    app.state.event_waiters.pop(tid, None)
 
     @app.get("/runs", response_model=RunsResponse)
     async def get_runs(request: Request):
@@ -998,8 +1211,10 @@ def create_app(
                 request.app.state.agent.close()
             except Exception:
                 pass
+            workdir = request.app.state.workdir
+            madgraph_bridge_dir = os.path.join("/runs/workdirs", workdir, "madgraph_bridge") if workdir else "/tmp/madgraph_bridge"
             request.app.state.agent = MadAgents(
-                madgraph_handle=request.app.state.madgraph_handle,
+                madgraph_bridge_dir=madgraph_bridge_dir,
                 user_handle=request.app.state.user_handle,
                 checkpointer=request.app.state.active_checkpointer
                 or request.app.state.checkpointer,
@@ -1052,8 +1267,6 @@ def create_app(
             )
 
         if request.app.state.thread_id == req.thread_id:
-            if request.app.state.madgraph_handle is not None:
-                stop_bridge(request.app.state.madgraph_handle)
             if request.app.state.agent is not None:
                 request.app.state.agent.close()
             request.app.state.thread_id = None
@@ -1134,6 +1347,7 @@ def create_app(
                 "workdir": run_info.workdir,
                 "run_db": "run.sqlite",
                 "workdir_dir": "workdir",
+                "orchestration_version": run_info.version or "v1.1",
             }
             with zipfile.ZipFile(
                 temp_bundle.name,
@@ -1242,6 +1456,16 @@ def create_app(
                         detail="Invalid .madrun archive",
                     )
 
+                manifest_path = os.path.join(temp_dir, "manifest.json")
+                imported_version = None
+                if os.path.isfile(manifest_path):
+                    try:
+                        with open(manifest_path, "r") as mf:
+                            manifest_data = json.loads(mf.read())
+                        imported_version = manifest_data.get("orchestration_version")
+                    except Exception:
+                        pass
+
                 with sqlite3.connect(f"file:{run_db_path}?mode=ro", uri=True) as conn:
                     row = conn.execute(
                         "SELECT thread_id FROM runs LIMIT 1"
@@ -1277,6 +1501,12 @@ def create_app(
                         new_thread_id,
                         request.app.state.checkpoints_db,
                     )
+                    with sqlite3.connect(request.app.state.runs_db, timeout=5) as conn:
+                        conn.execute(
+                            "UPDATE runs SET version=? WHERE thread_id=?",
+                            ("v1.1", new_thread_id),
+                        )
+                        conn.commit()
                     merge_run_checkpoints(
                         run_db_path,
                         request.app.state.checkpoints_db,
@@ -1286,6 +1516,7 @@ def create_app(
                     )
                 except Exception as exc:
                     shutil.rmtree(target_workdir, ignore_errors=True)
+                    delete_run_records(request.app.state.runs_db, new_thread_id)
                     raise HTTPException(
                         status_code=500,
                         detail=f"Failed to import run data: {exc}",
@@ -1401,6 +1632,8 @@ def create_app(
         async def event_stream():
             idx = max(start_idx, 0)
             while True:
+                if await request.is_disconnected():
+                    break
                 buffer = app.state.event_buffers.get(ACTIVE_EVENT_KEY, [])
                 if idx > len(buffer):
                     idx = len(buffer)
@@ -1409,8 +1642,6 @@ def create_app(
                     yield f"id: {idx}\n"
                     yield f"data: {json.dumps(payload)}\n\n"
                     idx += 1
-                if await request.is_disconnected():
-                    break
                 condition = app.state.event_waiters.get(ACTIVE_EVENT_KEY)
                 if condition is None:
                     await asyncio.sleep(0.1)
@@ -1450,6 +1681,8 @@ def create_app(
         async def event_stream():
             idx = max(start_idx, 0)
             while True:
+                if await request.is_disconnected():
+                    break
                 buffer = app.state.event_buffers.get(thread_id, [])
                 if idx > len(buffer):
                     idx = len(buffer)
@@ -1458,8 +1691,6 @@ def create_app(
                     yield f"id: {idx}\n"
                     yield f"data: {json.dumps(payload)}\n\n"
                     idx += 1
-                if await request.is_disconnected():
-                    break
                 condition = app.state.event_waiters.get(thread_id)
                 if condition is None:
                     await asyncio.sleep(0.1)
@@ -1610,6 +1841,7 @@ def create_app(
                 run_id,
                 workdir_rel,
                 checkpoint_db=request.app.state.checkpoints_db,
+                version="v1.1",
             )
             req.thread_id = run_id
 
@@ -1643,3 +1875,65 @@ async def _update_graph_state(graph, config: dict, values: dict) -> None:
             update_fn(config, values, as_node="interrupt")
         return
     print("Graph state update not supported; interrupt message not persisted.")
+
+
+async def _repair_checkpoint_tool_calls(graph, thread_id: str) -> None:
+    """Repair unmatched tool calls in checkpoint state.
+
+    When a run is interrupted or crashes, tool calls may be left without
+    matching tool results.  This synthesizes 'failed' tool results for any
+    unmatched calls so the conversation can continue cleanly on resume.
+    """
+    config = {"configurable": {"thread_id": thread_id}}
+    try:
+        checkpoint = await graph.aget_state(config)
+        values = checkpoint.values if checkpoint else {}
+    except Exception as exc:
+        print(f"Could not load checkpoint for repair ({thread_id}): {exc}")
+        return
+    if not values:
+        return
+
+    update: dict = {}
+    reason = "Interrupted before completion (repaired on load)."
+
+    # Repair orchestrator_messages
+    orch_msgs = values.get("orchestrator_messages", [])
+    if orch_msgs:
+        unmatched = find_unmatched_tool_calls(orch_msgs)
+        if unmatched:
+            update["orchestrator_messages"] = synthesize_interrupt_tool_messages(
+                unmatched, reason=reason,
+            )
+
+    # Repair per-agent message batches (agents_messages)
+    agents_messages = values.get("agents_messages", {})
+    repaired_batches: dict = {}
+    if isinstance(agents_messages, dict):
+        for agent_name, batches in agents_messages.items():
+            if not isinstance(batches, dict):
+                continue
+            for msg_id, batch in batches.items():
+                if not isinstance(batch, list):
+                    continue
+                unmatched = find_unmatched_tool_calls(batch)
+                if unmatched:
+                    synthetic = synthesize_interrupt_tool_messages(
+                        unmatched, reason=reason,
+                    )
+                    repaired_batches.setdefault(agent_name, {})[msg_id] = batch + synthetic
+
+    if repaired_batches:
+        update["agents_messages"] = repaired_batches
+
+    if update:
+        repaired_keys = []
+        if "orchestrator_messages" in update:
+            repaired_keys.append("orchestrator")
+        if "agents_messages" in update:
+            repaired_keys.extend(repaired_batches.keys())
+        try:
+            await _update_graph_state(graph, config, update)
+            print(f"Repaired unmatched tool calls for thread {thread_id}: {repaired_keys}")
+        except Exception as exc:
+            print(f"Failed to repair unmatched tool calls for {thread_id}: {exc}")

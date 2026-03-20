@@ -4,19 +4,22 @@ import { CONTROL_CHAR_REGEX } from "./constants";
 
 /**
  * Map an internal recipient id to a display name, falling back to the raw value.
+ * When instanceId is provided and non-zero, appends " #<instanceId>" to the name.
  * @param {string | null | undefined} name
+ * @param {number | null | undefined} instanceId
  * @returns {string | null | undefined}
  */
-export const getRecipientDisplayName = (name) => {
+export const getRecipientDisplayName = (name, instanceId) => {
   if (name === null || name === undefined || name === "") {
     return name;
   }
   const key = String(name);
   const mapped = recipientNameMap?.[key];
-  if (typeof mapped === "string" && mapped.trim() !== "") {
-    return mapped;
+  const base = (typeof mapped === "string" && mapped.trim() !== "") ? mapped : key;
+  if (instanceId != null && instanceId !== 0) {
+    return `${base} #${instanceId}`;
   }
-  return key;
+  return base;
 };
 
 /**
@@ -94,11 +97,16 @@ export function formatCostNote(note) {
 /**
  * Render a user-friendly agent label.
  * @param {string | null | undefined} name
+ * @param {number | null | undefined} instanceId
  * @returns {string}
  */
-export function formatRecipientLabel(name) {
+export function formatRecipientLabel(name, instanceId) {
   if (!name) {
     return "Unknown";
   }
-  return recipientNameMap[name] ?? name;
+  const base = recipientNameMap[name] ?? name;
+  if (instanceId != null && instanceId !== 0) {
+    return `${base} #${instanceId}`;
+  }
+  return base;
 }

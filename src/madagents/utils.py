@@ -11,25 +11,10 @@ from typing import Any, Dict
 
 from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, ToolMessage
 from langgraph.graph.message import add_messages as _add_messages
-from pydantic import ValidationError
 
 #########################################################################
 ## LLM helpers ##########################################################
 #########################################################################
-
-def invoke_with_validation_retry(llm, messages, *, reasoning=None, max_retries: int = 2):
-    """Invoke an LLM and retry when structured output validation fails."""
-    last_exc = None
-    for attempt in range(max_retries + 1):
-        try:
-            if reasoning is None:
-                return llm.invoke(messages)
-            return llm.invoke(messages, reasoning=reasoning)
-        except ValidationError as exc:
-            last_exc = exc
-            if attempt >= max_retries:
-                raise
-    raise last_exc
 
 def inject_optional_prompt_lines(prompt: str, marker: str, lines: str) -> str:
     """Replace a marker line with optional content without leaving blank lines."""
@@ -76,6 +61,20 @@ def pdf_to_content_block(file_path: str, filename: str | None = None) -> dict:
         "filename": filename,
     }
 
+def pdf_to_anthropic_content_block(file_path: str) -> dict:
+    """Load a PDF and return an Anthropic document content block."""
+    with open(file_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    return {
+        "type": "document",
+        "source": {
+            "type": "base64",
+            "media_type": "application/pdf",
+            "data": b64,
+        },
+    }
+
 def image_to_content_block(file_path: str) -> dict:
     """Load an image from disk and return an image content block payload."""
     mime_type, _ = mimetypes.guess_type(file_path)
@@ -90,6 +89,24 @@ def image_to_content_block(file_path: str) -> dict:
         "type": "image",
         "base64": b64,
         "mime_type": mime_type
+    }
+
+def image_to_anthropic_content_block(file_path: str) -> dict:
+    """Load an image and return an Anthropic image content block."""
+    mime_type, _ = mimetypes.guess_type(file_path)
+    if mime_type is None or not mime_type.startswith("image/"):
+        mime_type = "image/png"
+
+    with open(file_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    return {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": mime_type,
+            "data": b64,
+        },
     }
 
 #########################################################################
@@ -128,6 +145,32 @@ def response_to_text(response):
 
     # Join multiple text parts with a newline (adjust if you prefer spaces)
     return "\n".join(texts)
+
+def extract_thinking(response: AIMessage) -> str:
+    """Extract thinking content from Anthropic extended-thinking blocks."""
+    content = getattr(response, "content", None)
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for block in content:
+        block_type = block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
+        if block_type == "thinking":
+            text = block.get("thinking") if isinstance(block, dict) else getattr(block, "thinking", None)
+            if text:
+                parts.append(text)
+    return "\n\n".join(parts)
+
+
+def extract_token_kwargs(response: BaseMessage) -> dict[str, int]:
+    """Extract token count fields from a response into a kwargs dict."""
+    token_counts = extract_output_token_counts(response) or {}
+    result: dict[str, int] = {}
+    for key in ("non_reasoning_output_tokens", "reasoning_output_tokens", "output_tokens"):
+        val = token_counts.get(key)
+        if isinstance(val, int):
+            result[key] = val
+    return result
+
 
 #########################################################################
 ## Serialization ########################################################

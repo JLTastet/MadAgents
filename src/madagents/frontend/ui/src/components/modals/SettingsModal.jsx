@@ -1,10 +1,13 @@
 import React from "react";
 import {
+  groupModelsByProvider,
+  inferProviderFromModel,
+  modelsForRouting,
+  strongestModelForProvider,
   REASONING_EFFORT_LEVELS,
   SUPPORTED_MODELS,
   VERBOSITY_LEVELS,
   WORKER_AGENTS,
-  darkTheme,
 } from "../../lib/constants";
 import { formatRecipientLabel } from "../../lib/formatters";
 
@@ -12,7 +15,7 @@ const configHelpText = {
   workflow_step_limit:
     "Maximum number of internal decision steps while handling a single user message. The counter resets for each new user message. If the limit is reached, the run stops and an error is shown.",
   model: "Selects which language model this agent will use.",
-  verbosity: "Controls how detailed the agent’s responses tend to be.",
+  verbosity: "Controls how detailed the agent’s responses tend to be. This setting only applies to OpenAI models; Anthropic models do not support it.",
   step_limit:
     "Maximum number of internal cycles this agent may take when it is selected to act. In each cycle, the agent may call one or more tools and then continue. The counter resets the next time this agent is selected. If the limit is reached, the run stops and an error is shown.",
   reasoning_effort:
@@ -27,6 +30,8 @@ const configHelpText = {
     "The summarizer first keeps the last N messages verbatim. If a response includes multiple tool calls, it still counts as one message. Then it keeps additional recent messages until it reaches the “Keep recent tokens” budget. Everything older than that is summarized.",
   require_madgraph_evidence:
     "Require evidence-backed explanations for MadGraph and related tools. This can significantly improve response quality, but may increase invocation time and cost.",
+  enable_worker_model_routing:
+    "Let the orchestrator choose which model each worker uses based on task complexity. For OpenAI, it routes between nano, mini, and the orchestrator's own model for complex tasks (defaults to gpt-5.2 if the orchestrator is on a lower tier).",
 };
 
 /**
@@ -112,6 +117,22 @@ export default function SettingsModal({
     </span>
   );
 
+  const modelGroups = groupModelsByProvider(SUPPORTED_MODELS);
+  const renderModelOptions = (emptyLabel = null) => (
+    <>
+      {emptyLabel ? <option value="">{emptyLabel}</option> : null}
+      {modelGroups.map((group) => (
+        <optgroup key={group.label} label={group.label}>
+          {group.models.map((model) => (
+            <option key={model} value={model}>
+              {model}
+            </option>
+          ))}
+        </optgroup>
+      ))}
+    </>
+  );
+
   return (
     <div
       onClick={onClose}
@@ -185,7 +206,7 @@ export default function SettingsModal({
             <div
               style={{
                 fontSize: "0.9rem",
-                color: theme === darkTheme ? "#fca5a5" : "#b91c1c",
+                color: theme.errorText,
               }}
             >
               {configError}
@@ -194,91 +215,6 @@ export default function SettingsModal({
 
           {!configLoading && configDraft && (
             <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
-              <div
-                style={{
-                  padding: "0.9rem",
-                  borderRadius: "0.85rem",
-                  border: `1px solid ${theme.border}`,
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: "0.8rem",
-                }}
-              >
-                <div
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "0.35rem",
-                    fontSize: "0.9rem",
-                    fontWeight: 500,
-                    minWidth: 0,
-                  }}
-                >
-                  <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                    Require evidence for explanations about MadGraph and related tools
-                  </span>
-                  {renderHelpButton(
-                    "require_madgraph_evidence",
-                    "MadGraph and related tools evidence requirement",
-                    "require_madgraph_evidence",
-                    { minWidth: "320px", maxWidth: "420px" }
-                  )}
-                </div>
-                <label
-                  style={{
-                    display: "inline-flex",
-                    alignItems: "center",
-                    gap: "0.5rem",
-                    cursor: "pointer",
-                    width: "fit-content",
-                    flexShrink: 0,
-                  }}
-                >
-                  <input
-                    type="checkbox"
-                    checked={Boolean(configDraft.require_madgraph_evidence)}
-                    onChange={(e) =>
-                      updateGlobalField("require_madgraph_evidence", e.target.checked)
-                    }
-                    style={{ display: "none" }}
-                  />
-                  <span
-                    style={{
-                      width: "42px",
-                      height: "24px",
-                      borderRadius: "999px",
-                      border: `1px solid ${theme.border}`,
-                      background: configDraft.require_madgraph_evidence
-                        ? "rgba(37, 99, 235, 0.95)"
-                        : theme.inputBg,
-                      position: "relative",
-                      transition: "background 0.15s ease",
-                      boxShadow: configDraft.require_madgraph_evidence
-                        ? "0 0 0 2px rgba(37, 99, 235, 0.18)"
-                        : "none",
-                    }}
-                  >
-                    <span
-                      style={{
-                        position: "absolute",
-                        top: "2px",
-                        left: configDraft.require_madgraph_evidence ? "20px" : "2px",
-                        width: "18px",
-                        height: "18px",
-                        borderRadius: "999px",
-                        background: "#fff",
-                        boxShadow: "0 1px 3px rgba(0,0,0,0.3)",
-                        transition: "left 0.15s ease",
-                      }}
-                    />
-                  </span>
-                  <span style={{ fontSize: "0.85rem", opacity: 0.8 }}>
-                    {configDraft.require_madgraph_evidence ? "On" : "Off"}
-                  </span>
-                </label>
-              </div>
-
               <div
                 style={{
                   padding: "0.9rem",
@@ -324,6 +260,121 @@ export default function SettingsModal({
                 </div>
               </div>
 
+              {(() => {
+                // Determine routing models using orchestrator model as strongest,
+                // mirroring backend _strongest_model_for_provider logic.
+                const firstWorker = WORKER_AGENTS.find((name) => configDraft.agents?.[name]);
+                const workerModel = firstWorker ? configDraft.agents[firstWorker]?.model : null;
+                const workerProvider = workerModel ? inferProviderFromModel(workerModel) : null;
+                const providerLabel = workerProvider === "anthropic" ? "Anthropic" : workerProvider === "openai" ? "OpenAI" : "Unknown";
+                const orchModel = configDraft.agents?.orchestrator?.model || "";
+                const providerModels = workerProvider === "anthropic"
+                  ? SUPPORTED_MODELS.filter((m) => m.startsWith("claude-"))
+                  : SUPPORTED_MODELS.filter((m) => m.startsWith("gpt-"));
+                const strongest = strongestModelForProvider(orchModel, workerProvider || "openai");
+                const routingModels = modelsForRouting(providerModels, strongest);
+
+                return (
+              <div
+                style={{
+                  padding: "0.9rem",
+                  borderRadius: "0.85rem",
+                  border: `1px solid ${theme.border}`,
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "0.5rem",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "0.8rem",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "0.35rem",
+                      fontSize: "0.9rem",
+                      fontWeight: 500,
+                      minWidth: 0,
+                    }}
+                  >
+                    <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                      Orchestrator model routing for workers
+                    </span>
+                    {renderHelpButton(
+                      "enable_worker_model_routing",
+                      "worker model routing",
+                      "enable_worker_model_routing",
+                      { minWidth: "320px", maxWidth: "420px" }
+                    )}
+                  </div>
+                  <label
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "0.5rem",
+                      cursor: "pointer",
+                      width: "fit-content",
+                      flexShrink: 0,
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={Boolean(configDraft.enable_worker_model_routing)}
+                      onChange={(e) =>
+                        updateGlobalField("enable_worker_model_routing", e.target.checked)
+                      }
+                      style={{ display: "none" }}
+                    />
+                    <span
+                      style={{
+                        width: "42px",
+                        height: "24px",
+                        borderRadius: "999px",
+                        border: `1px solid ${theme.border}`,
+                        background: configDraft.enable_worker_model_routing
+                          ? "rgba(37, 99, 235, 0.95)"
+                          : theme.inputBg,
+                        position: "relative",
+                        transition: "background 0.15s ease",
+                        boxShadow: configDraft.enable_worker_model_routing
+                          ? "0 0 0 2px rgba(37, 99, 235, 0.18)"
+                          : "none",
+                      }}
+                    >
+                      <span
+                        style={{
+                          position: "absolute",
+                          top: "2px",
+                          left: configDraft.enable_worker_model_routing ? "20px" : "2px",
+                          width: "18px",
+                          height: "18px",
+                          borderRadius: "999px",
+                          background: "#fff",
+                          boxShadow: "0 1px 3px rgba(0,0,0,0.3)",
+                          transition: "left 0.15s ease",
+                        }}
+                      />
+                    </span>
+                    <span style={{ fontSize: "0.85rem", opacity: 0.8 }}>
+                      {configDraft.enable_worker_model_routing ? "On" : "Off"}
+                    </span>
+                  </label>
+                </div>
+                {configDraft.enable_worker_model_routing && (
+                  <div style={{ fontSize: "0.8rem", opacity: 0.6 }}>
+                    Provider: <strong>{providerLabel}</strong> — routing between: {routingModels.join(", ") || "none"}
+                  </div>
+                )}
+              </div>
+                );
+              })()}
+
               <div
                 style={{
                   padding: "0.9rem",
@@ -357,7 +408,7 @@ export default function SettingsModal({
                     {renderHelpButton("step_limit_controlling", "step limit", "step_limit")}
                   </div>
                 </div>
-                {["orchestrator", "planner", "plan_updater", "reviewer"]
+                {["orchestrator", "planner", "plan_reviewer", "verification_reviewer", "presentation_reviewer"]
                   .filter((name) => configDraft.agents?.[name])
                   .map((agentName) => {
                     const cfg = configDraft.agents[agentName];
@@ -386,32 +437,32 @@ export default function SettingsModal({
                             fontSize: "0.85rem",
                           }}
                         >
-                          {SUPPORTED_MODELS.map((model) => (
-                            <option key={model} value={model}>
-                              {model}
-                            </option>
-                          ))}
+                          {renderModelOptions()}
                         </select>
-                        <select
-                          value={cfg.verbosity}
-                          onChange={(e) =>
-                            updateAgentField(agentName, "verbosity", e.target.value)
-                          }
-                          style={{
-                            padding: "0.4rem 0.6rem",
-                            borderRadius: "0.5rem",
-                            border: `1px solid ${theme.border}`,
-                            background: theme.inputBg,
-                            color: theme.text,
-                            fontSize: "0.85rem",
-                          }}
-                        >
-                          {VERBOSITY_LEVELS.map((level) => (
-                            <option key={level} value={level}>
-                              {level}
-                            </option>
-                          ))}
-                        </select>
+                        {inferProviderFromModel(cfg.model) === "anthropic" ? (
+                          <div style={{ opacity: 0.4, fontSize: "0.85rem" }}>N/A</div>
+                        ) : (
+                          <select
+                            value={cfg.verbosity}
+                            onChange={(e) =>
+                              updateAgentField(agentName, "verbosity", e.target.value)
+                            }
+                            style={{
+                              padding: "0.4rem 0.6rem",
+                              borderRadius: "0.5rem",
+                              border: `1px solid ${theme.border}`,
+                              background: theme.inputBg,
+                              color: theme.text,
+                              fontSize: "0.85rem",
+                            }}
+                          >
+                            {VERBOSITY_LEVELS.map((level) => (
+                              <option key={level} value={level}>
+                                {level}
+                              </option>
+                            ))}
+                          </select>
+                        )}
                         {cfg.supports_step_limit ? (
                           <input
                             type="number"
@@ -488,37 +539,36 @@ export default function SettingsModal({
                         fontSize: "0.85rem",
                       }}
                     >
-                      <option value="">Model (no change)</option>
-                      {SUPPORTED_MODELS.map((model) => (
-                        <option key={model} value={model}>
-                          {model}
-                        </option>
-                      ))}
+                      {renderModelOptions("Model (no change)")}
                     </select>
-                    <select
-                      value={workerGroup.verbosity}
-                      onChange={(e) =>
-                        setWorkerGroup((prev) => ({
-                          ...prev,
-                          verbosity: e.target.value,
-                        }))
-                      }
-                      style={{
-                        padding: "0.4rem 0.6rem",
-                        borderRadius: "0.5rem",
-                        border: `1px solid ${theme.border}`,
-                        background: theme.inputBg,
-                        color: theme.text,
-                        fontSize: "0.85rem",
-                      }}
-                    >
-                      <option value="">Verbosity (no change)</option>
-                      {VERBOSITY_LEVELS.map((level) => (
-                        <option key={level} value={level}>
-                          {level}
-                        </option>
-                      ))}
-                    </select>
+                    {inferProviderFromModel(workerGroup.model) === "anthropic" ? (
+                      <div style={{ opacity: 0.4, fontSize: "0.85rem", padding: "0.4rem 0.6rem" }}>N/A</div>
+                    ) : (
+                      <select
+                        value={workerGroup.verbosity}
+                        onChange={(e) =>
+                          setWorkerGroup((prev) => ({
+                            ...prev,
+                            verbosity: e.target.value,
+                          }))
+                        }
+                        style={{
+                          padding: "0.4rem 0.6rem",
+                          borderRadius: "0.5rem",
+                          border: `1px solid ${theme.border}`,
+                          background: theme.inputBg,
+                          color: theme.text,
+                          fontSize: "0.85rem",
+                        }}
+                      >
+                        <option value="">Verbosity (no change)</option>
+                        {VERBOSITY_LEVELS.map((level) => (
+                          <option key={level} value={level}>
+                            {level}
+                          </option>
+                        ))}
+                      </select>
+                    )}
                     <input
                       type="number"
                       min="1"
@@ -608,32 +658,32 @@ export default function SettingsModal({
                           fontSize: "0.85rem",
                         }}
                       >
-                        {SUPPORTED_MODELS.map((model) => (
-                          <option key={model} value={model}>
-                            {model}
-                          </option>
-                        ))}
+                        {renderModelOptions()}
                       </select>
-                      <select
-                        value={cfg.verbosity}
-                        onChange={(e) =>
-                          updateAgentField(agentName, "verbosity", e.target.value)
-                        }
-                        style={{
-                          padding: "0.4rem 0.6rem",
-                          borderRadius: "0.5rem",
-                          border: `1px solid ${theme.border}`,
-                          background: theme.inputBg,
-                          color: theme.text,
-                          fontSize: "0.85rem",
-                        }}
-                      >
-                        {VERBOSITY_LEVELS.map((level) => (
-                          <option key={level} value={level}>
-                            {level}
-                          </option>
-                        ))}
-                      </select>
+                      {inferProviderFromModel(cfg.model) === "anthropic" ? (
+                        <div style={{ opacity: 0.4, fontSize: "0.85rem" }}>N/A</div>
+                      ) : (
+                        <select
+                          value={cfg.verbosity}
+                          onChange={(e) =>
+                            updateAgentField(agentName, "verbosity", e.target.value)
+                          }
+                          style={{
+                            padding: "0.4rem 0.6rem",
+                            borderRadius: "0.5rem",
+                            border: `1px solid ${theme.border}`,
+                            background: theme.inputBg,
+                            color: theme.text,
+                            fontSize: "0.85rem",
+                          }}
+                        >
+                          {VERBOSITY_LEVELS.map((level) => (
+                            <option key={level} value={level}>
+                              {level}
+                            </option>
+                          ))}
+                        </select>
+                      )}
                       <input
                         type="number"
                         min="1"
@@ -720,32 +770,32 @@ export default function SettingsModal({
                         fontSize: "0.85rem",
                       }}
                     >
-                      {SUPPORTED_MODELS.map((model) => (
-                        <option key={model} value={model}>
-                          {model}
-                        </option>
-                      ))}
+                      {renderModelOptions()}
                     </select>
-                    <select
-                      value={configDraft.agents.summarizer.verbosity}
-                      onChange={(e) =>
-                        updateAgentField("summarizer", "verbosity", e.target.value)
-                      }
-                      style={{
-                        padding: "0.4rem 0.6rem",
-                        borderRadius: "0.5rem",
-                        border: `1px solid ${theme.border}`,
-                        background: theme.inputBg,
-                        color: theme.text,
-                        fontSize: "0.85rem",
-                      }}
-                    >
-                      {VERBOSITY_LEVELS.map((level) => (
-                        <option key={level} value={level}>
-                          {level}
-                        </option>
-                      ))}
-                    </select>
+                    {inferProviderFromModel(configDraft.agents.summarizer.model) === "anthropic" ? (
+                      <div style={{ opacity: 0.4, fontSize: "0.85rem" }}>N/A</div>
+                    ) : (
+                      <select
+                        value={configDraft.agents.summarizer.verbosity}
+                        onChange={(e) =>
+                          updateAgentField("summarizer", "verbosity", e.target.value)
+                        }
+                        style={{
+                          padding: "0.4rem 0.6rem",
+                          borderRadius: "0.5rem",
+                          border: `1px solid ${theme.border}`,
+                          background: theme.inputBg,
+                          color: theme.text,
+                          fontSize: "0.85rem",
+                        }}
+                      >
+                        {VERBOSITY_LEVELS.map((level) => (
+                          <option key={level} value={level}>
+                            {level}
+                          </option>
+                        ))}
+                      </select>
+                    )}
                     <select
                       value={configDraft.agents.summarizer.reasoning_effort ?? "low"}
                       onChange={(e) =>

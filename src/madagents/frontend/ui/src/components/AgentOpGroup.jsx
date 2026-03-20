@@ -2,8 +2,8 @@ import React, { useState } from "react";
 import { darkTheme } from "../lib/constants";
 import { getRecipientDisplayName, stripControlChars } from "../lib/formatters";
 import MarkdownBubble from "./MarkdownBubble";
-import ReplyAccordion from "./ReplyAccordion";
 import OrchestratorReasoningBlock from "./OrchestratorReasoningBlock";
+import ReplyAccordion from "./ReplyAccordion";
 import {
   PlanCard,
   PlanUpdatesCard,
@@ -14,7 +14,7 @@ import {
 /**
  * Render grouped agent traces and final replies with optional instruction header.
  */
-export default function AgentOpGroup({ group, theme }) {
+export default function AgentOpGroup({ group, theme, hideHeader = false }) {
   const [open, setOpen] = useState(false);
   const { traces, mainMessage } = group;
   const agentName = group.agentName || "undefined agent";
@@ -29,9 +29,11 @@ export default function AgentOpGroup({ group, theme }) {
       ? stripControlChars(instruction.future_note)
       : "";
   const instructionRecipient = getRecipientDisplayName(
-    instruction?.recipient || agentName
+    instruction?.recipient || agentName,
+    group.instanceId
   );
   const instructionEffort = instruction?.reasoning_effort ?? "";
+  const instructionModel = instruction?.model ?? "";
   const hasInstruction = Boolean(
     instructionMessage ||
       instructionReasoning ||
@@ -47,6 +49,9 @@ export default function AgentOpGroup({ group, theme }) {
   const showPlanUpdates =
     normalizedAgentName === "plan_updater" && planUpdateSteps.length > 0;
 
+  const agentReasoning = stripControlChars(
+    mainMessage?.add_content?.reasoning || ""
+  );
   const hasTraces = traces && traces.length > 0;
 
   const formatPayload = (payload) => {
@@ -105,6 +110,30 @@ export default function AgentOpGroup({ group, theme }) {
         ) : null}
       </span>
     );
+
+    // THINKING trace → italic reasoning
+    if (tType === "thinking") {
+      const text = addContent.content ?? "";
+      if (!text.trim()) return null;
+      return (
+        <div
+          key={i}
+          style={{
+            borderRadius: "0.6rem",
+            padding: "0.5rem 0.6rem",
+            background: theme === darkTheme ? "#020617" : "#ffffff",
+            border: `1px solid ${theme.border}`,
+            fontSize: "0.8rem",
+            opacity: 0.85,
+            fontStyle: "italic",
+          }}
+        >
+          <MarkdownBubble isUser={false} theme={theme}>
+            {text}
+          </MarkdownBubble>
+        </div>
+      );
+    }
 
     // TEXT trace → markdown
     if (tType === "text") {
@@ -347,7 +376,7 @@ export default function AgentOpGroup({ group, theme }) {
                       <div
                         style={{
                           borderRadius: "0.4rem",
-                          background: "#111827",
+                          background: "#111827", color: "#e2e8f0",
                           padding: "0.4rem 0.6rem",
                           fontFamily:
                             "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, \"Liberation Mono\", \"Courier New\", monospace",
@@ -386,7 +415,7 @@ export default function AgentOpGroup({ group, theme }) {
                           padding: "0.4rem 0.6rem",
                           borderRadius: "0.4rem",
                           overflowX: "auto",
-                          background: "#111827",
+                          background: "#111827", color: "#e2e8f0",
                           fontSize: "0.8rem",
                           marginTop: "0.4rem",
                         }}
@@ -433,7 +462,7 @@ export default function AgentOpGroup({ group, theme }) {
                 padding: "0.4rem 0.6rem",
                 borderRadius: "0.4rem",
                 overflowX: "auto",
-                background: "#111827",
+                background: "#111827", color: "#e2e8f0",
                 fontSize: "0.8rem",
               }}
             >
@@ -472,7 +501,7 @@ export default function AgentOpGroup({ group, theme }) {
                 padding: "0.4rem 0.6rem",
                 borderRadius: "0.4rem",
                 overflowX: "auto",
-                background: "#111827",
+                background: "#111827", color: "#e2e8f0",
                 fontSize: "0.8rem",
               }}
             >
@@ -688,7 +717,7 @@ export default function AgentOpGroup({ group, theme }) {
                 padding: "0.4rem 0.6rem",
                 borderRadius: "0.4rem",
                 overflowX: "auto",
-                background: "#111827",
+                background: "#111827", color: "#e2e8f0",
                 fontSize: "0.8rem",
               }}
             >
@@ -738,7 +767,7 @@ export default function AgentOpGroup({ group, theme }) {
                   padding: "0.4rem 0.6rem",
                   borderRadius: "0.4rem",
                   overflowX: "auto",
-                  background: "#111827",
+                  background: "#111827", color: "#e2e8f0",
                   fontSize: "0.8rem",
                 }}
               >
@@ -942,7 +971,7 @@ export default function AgentOpGroup({ group, theme }) {
                     padding: "0.4rem 0.6rem",
                     borderRadius: "0.4rem",
                     overflowX: "auto",
-                    background: "#111827",
+                    background: "#111827", color: "#e2e8f0",
                     fontSize: "0.8rem",
                   }}
                 >
@@ -967,7 +996,7 @@ export default function AgentOpGroup({ group, theme }) {
                     padding: "0.4rem 0.6rem",
                     borderRadius: "0.4rem",
                     overflowX: "auto",
-                    background: "#111827",
+                    background: "#111827", color: "#e2e8f0",
                     fontSize: "0.8rem",
                   }}
                 >
@@ -1023,7 +1052,7 @@ export default function AgentOpGroup({ group, theme }) {
                   padding: "0.4rem 0.6rem",
                   borderRadius: "0.4rem",
                   overflowX: "auto",
-                  background: "#111827",
+                  background: "#111827", color: "#e2e8f0",
                   fontSize: "0.8rem",
                 }}
               >
@@ -1218,7 +1247,7 @@ export default function AgentOpGroup({ group, theme }) {
                     padding: "0.4rem 0.6rem",
                     borderRadius: "0.4rem",
                     overflowX: "auto",
-                    background: "#111827",
+                    background: "#111827", color: "#e2e8f0",
                     fontSize: "0.8rem",
                   }}
                 >
@@ -1254,7 +1283,7 @@ export default function AgentOpGroup({ group, theme }) {
                     padding: "0.4rem 0.6rem",
                     borderRadius: "0.4rem",
                     overflowX: "auto",
-                    background: "#111827",
+                    background: "#111827", color: "#e2e8f0",
                     fontSize: "0.8rem",
                   }}
                 >
@@ -1332,7 +1361,7 @@ export default function AgentOpGroup({ group, theme }) {
                     padding: "0.4rem 0.6rem",
                     borderRadius: "0.4rem",
                     overflowX: "auto",
-                    background: "#111827",
+                    background: "#111827", color: "#e2e8f0",
                     fontSize: "0.8rem",
                   }}
                 >
@@ -1357,7 +1386,7 @@ export default function AgentOpGroup({ group, theme }) {
                     padding: "0.4rem 0.6rem",
                     borderRadius: "0.4rem",
                     overflowX: "auto",
-                    background: "#111827",
+                    background: "#111827", color: "#e2e8f0",
                     fontSize: "0.8rem",
                   }}
                 >
@@ -1412,7 +1441,7 @@ export default function AgentOpGroup({ group, theme }) {
                   padding: "0.4rem 0.6rem",
                   borderRadius: "0.4rem",
                   overflowX: "auto",
-                  background: "#111827",
+                  background: "#111827", color: "#e2e8f0",
                   fontSize: "0.8rem",
                 }}
               >
@@ -1542,6 +1571,8 @@ export default function AgentOpGroup({ group, theme }) {
     return items;
   };
 
+  const inlineMessages = group.inlineMessages || [];
+
   return (
     <div
       style={{
@@ -1550,6 +1581,8 @@ export default function AgentOpGroup({ group, theme }) {
         display: "flex",
         flexDirection: "column",
         gap: "0.25rem",
+        borderLeft: `2px solid ${theme.border}`,
+        paddingLeft: "0.75rem",
       }}
     >
       {hasInstruction && (
@@ -1560,27 +1593,34 @@ export default function AgentOpGroup({ group, theme }) {
             gap: "0.35rem",
           }}
         >
-          <div
-            style={{
-              fontSize: "0.8rem",
-              opacity: 0.75,
-              marginLeft: "0.25rem",
-              display: "flex",
-              alignItems: "center",
-              gap: "0.35rem",
-            }}
-          >
-            <span style={{ fontWeight: 500 }}>
-              {getRecipientDisplayName("orchestrator")}
-            </span>
-            <span style={{ opacity: 0.6 }}>→</span>
-            <span>{instructionRecipient}</span>
-            {instructionEffort && (
-              <span style={{ fontSize: "0.7rem", opacity: 0.6 }}>
-                effort: {instructionEffort}
+          {!hideHeader && (
+            <div
+              style={{
+                fontSize: "0.8rem",
+                opacity: 0.75,
+                marginLeft: "0.25rem",
+                display: "flex",
+                alignItems: "center",
+                gap: "0.35rem",
+              }}
+            >
+              <span style={{ fontWeight: 500 }}>
+                {getRecipientDisplayName("orchestrator")}
               </span>
-            )}
-          </div>
+              <span style={{ opacity: 0.6 }}>→</span>
+              <span>{instructionRecipient}</span>
+              {instructionEffort && (
+                <span style={{ fontSize: "0.7rem", opacity: 0.6 }}>
+                  effort: {instructionEffort}
+                </span>
+              )}
+              {instructionModel && (
+                <span style={{ fontSize: "0.7rem", opacity: 0.6 }}>
+                  model: {instructionModel}
+                </span>
+              )}
+            </div>
+          )}
 
           <OrchestratorReasoningBlock
             reasoning={instructionReasoning}
@@ -1589,12 +1629,56 @@ export default function AgentOpGroup({ group, theme }) {
           />
 
           {instructionMessage && (
-            <ReplyAccordion theme={theme} defaultOpen={false} label="Instruction">
+            <ReplyAccordion theme={theme} defaultOpen={false} label={hideHeader ? `${instructionRecipient} — Instruction` : "Instruction"}>
               <MarkdownBubble isUser={false} theme={theme}>
                 {instructionMessage}
               </MarkdownBubble>
             </ReplyAccordion>
           )}
+        </div>
+      )}
+
+      {/* Inline messages (plan updates, etc.) */}
+      {inlineMessages.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: "0.35rem" }}>
+          {inlineMessages.map((msg, i) => {
+            const inlineAddContent = msg.add_content || {};
+            const inlinePlan = inlineAddContent.plan;
+            const inlinePlanUpdateSteps = Array.isArray(inlineAddContent.plan_update_steps)
+              ? inlineAddContent.plan_update_steps
+              : [];
+            if (inlinePlanUpdateSteps.length > 0) {
+              return (
+                <ReplyAccordion
+                  key={`inline-${i}`}
+                  theme={theme}
+                  defaultOpen={true}
+                  label={renderPlanUpdateLabel(inlinePlanUpdateSteps, theme, inlinePlan)}
+                >
+                  <PlanUpdatesCard steps={inlinePlanUpdateSteps} theme={theme} showStatusIcons={false} />
+                </ReplyAccordion>
+              );
+            }
+            if (inlinePlan && Array.isArray(inlinePlan.steps)) {
+              return (
+                <ReplyAccordion
+                  key={`inline-${i}`}
+                  theme={theme}
+                  defaultOpen={false}
+                  label={renderPlanLabel(inlinePlan, theme)}
+                >
+                  <PlanCard plan={inlinePlan} theme={theme} />
+                </ReplyAccordion>
+              );
+            }
+            const text = typeof msg.content === "string" ? msg.content : "";
+            if (!text.trim()) return null;
+            return (
+              <MarkdownBubble key={`inline-${i}`} isUser={false} theme={theme}>
+                {text}
+              </MarkdownBubble>
+            );
+          })}
         </div>
       )}
 
@@ -1647,6 +1731,15 @@ export default function AgentOpGroup({ group, theme }) {
         </div>
       )}
 
+      {/* Agent reasoning — only when there is no execution trace (otherwise thinking is inside it) */}
+      {agentReasoning && !hasTraces && (
+        <OrchestratorReasoningBlock
+          reasoning={agentReasoning}
+          futureNote=""
+          theme={theme}
+        />
+      )}
+
       {/* Final agent message */}
       {mainMessage &&
         (showPlanUpdates ? (
@@ -1654,7 +1747,7 @@ export default function AgentOpGroup({ group, theme }) {
             <ReplyAccordion
               theme={theme}
               defaultOpen={openMainReplyByDefault}
-              label={renderPlanUpdateLabel(planUpdateSteps, theme)}
+              label={renderPlanUpdateLabel(planUpdateSteps, theme, plannerPlan)}
             >
               <PlanUpdatesCard steps={planUpdateSteps} theme={theme} showStatusIcons={false} />
             </ReplyAccordion>

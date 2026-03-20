@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS runs (
     last_updated_at TEXT NOT NULL,
     workdir TEXT NOT NULL,
     name TEXT,
-    checkpoint_db TEXT
+    checkpoint_db TEXT,
+    version TEXT
 )
 """
 
@@ -52,6 +53,12 @@ def ensure_runs_table(db_path: str) -> None:
         }
         if "checkpoint_db" not in cols:
             conn.execute('ALTER TABLE "runs" ADD COLUMN checkpoint_db TEXT')
+        if "version" not in cols:
+            conn.execute('ALTER TABLE "runs" ADD COLUMN version TEXT')
+        # Migrate legacy v1.0 runs to v1.1 (v1.0 has been removed).
+        conn.execute(
+            "UPDATE runs SET version = 'v1.1' WHERE version IS NULL OR version = 'v1.0'"
+        )
         conn.commit()
 
 
@@ -103,7 +110,11 @@ def load_global_config(
         try:
             payload = json.loads(raw)
             config = coerce_config(payload)
-        except Exception:
+        except json.JSONDecodeError as exc:
+            print(f"[config] Failed to parse saved config JSON: {exc}")
+            config = None
+        except Exception as exc:
+            print(f"[config] Failed to load saved config: {exc}")
             config = None
 
     if config is None:
@@ -148,14 +159,15 @@ def add_run(
     workdir: str,
     name: Optional[str] = None,
     checkpoint_db: Optional[str] = None,
+    version: Optional[str] = None,
 ) -> None:
     """Insert a new run record."""
     now = _utcnow_iso()
     with sqlite3.connect(db_path, timeout=5) as conn:
         conn.execute(
-            "INSERT INTO runs (thread_id, created_at, last_updated_at, workdir, name, checkpoint_db) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (run_id, now, now, workdir, name, checkpoint_db),
+            "INSERT INTO runs (thread_id, created_at, last_updated_at, workdir, name, checkpoint_db, version) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (run_id, now, now, workdir, name, checkpoint_db, version),
         )
         conn.commit()
 
@@ -218,7 +230,7 @@ def list_runs(db_path: str) -> list[RunInfo]:
     """Return all runs ordered by last update time (descending)."""
     with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
         rows = conn.execute(
-            "SELECT thread_id, created_at, last_updated_at, workdir, name "
+            "SELECT thread_id, created_at, last_updated_at, workdir, name, version "
             "FROM runs ORDER BY last_updated_at DESC"
         ).fetchall()
         return [
@@ -228,6 +240,7 @@ def list_runs(db_path: str) -> list[RunInfo]:
                 last_updated_at=row[2],
                 workdir=row[3],
                 name=row[4],
+                version=row[5],
             )
             for row in rows
         ]
@@ -238,7 +251,7 @@ def get_run_info(db_path: str, run_id: str) -> Optional[RunInfo]:
     try:
         with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
             row = conn.execute(
-                "SELECT thread_id, created_at, last_updated_at, workdir, name "
+                "SELECT thread_id, created_at, last_updated_at, workdir, name, version "
                 "FROM runs WHERE thread_id=?",
                 (run_id,),
             ).fetchone()
@@ -252,4 +265,5 @@ def get_run_info(db_path: str, run_id: str) -> Optional[RunInfo]:
         last_updated_at=row[2],
         workdir=row[3],
         name=row[4],
+        version=row[5],
     )

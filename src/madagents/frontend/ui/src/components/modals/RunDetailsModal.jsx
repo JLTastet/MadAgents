@@ -1,5 +1,4 @@
 import React from "react";
-import { darkTheme } from "../../lib/constants";
 import { formatApproxCost, formatCostNote, formatRunTimestamp } from "../../lib/formatters";
 
 /**
@@ -118,7 +117,7 @@ export default function RunDetailsModal({
           <div
             style={{
               fontSize: "0.9rem",
-              color: theme === darkTheme ? "#fca5a5" : "#b91c1c",
+              color: theme.errorText,
             }}
           >
             {runDetailsError}
@@ -135,6 +134,8 @@ export default function RunDetailsModal({
             }}
           >
             {renderDetailRow("Name", runDetails.name?.trim() || "Unnamed run")}
+
+            {renderDetailRow("Version", runDetails.version || "v1.1")}
 
             {renderDetailRow("Thread ID", runDetails.thread_id || "—", {
               fontFamily:

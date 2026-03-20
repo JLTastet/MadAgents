@@ -65,6 +65,7 @@ const MessageComposer = memo(function MessageComposer({
         padding: "1rem",
         borderTop: `1px solid ${theme.headerBorder}`,
         background: theme.inputBg,
+        alignItems: "flex-end",
       }}
     >
       <textarea
@@ -103,7 +104,7 @@ const MessageComposer = memo(function MessageComposer({
             padding: "0.75rem 1.25rem",
             borderRadius: "999px",
             border: "none",
-            background: canInterrupt ? "#dc2626" : "#6b7280",
+            background: canInterrupt ? theme.interruptBg : theme.disabledBg,
             color: "white",
             fontWeight: 500,
             fontSize: "1rem",
@@ -120,7 +121,7 @@ const MessageComposer = memo(function MessageComposer({
             padding: "0.75rem 1.25rem",
             borderRadius: "999px",
             border: "none",
-            background: blockNewMessages ? "#6b7280" : "#2563eb",
+            background: blockNewMessages ? theme.disabledBg : theme.userBubbleBg,
             color: "white",
             fontWeight: 500,
             fontSize: "1rem",

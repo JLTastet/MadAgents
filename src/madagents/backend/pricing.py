@@ -11,6 +11,8 @@ from madagents.backend.messages import (
     _message_response_metadata,
     _message_tool_call_id,
     _message_usage_metadata,
+    _get_tool_call_id,
+    _get_tool_call_name,
 )
 
 #########################################################################
@@ -20,11 +22,6 @@ from madagents.backend.messages import (
 PRICING_ENV_VAR = "MADAGENTS_PRICING_JSON"
 
 DEFAULT_PRICING_TABLE = {
-    "gpt-5": {
-        "input_per_1m": 1.25,
-        "cached_input_per_1m": 0.125,
-        "output_per_1m": 10.0,
-    },
     "gpt-5.1": {
         "input_per_1m": 1.25,
         "cached_input_per_1m": 0.125,
@@ -35,6 +32,11 @@ DEFAULT_PRICING_TABLE = {
         "cached_input_per_1m": 0.175,
         "output_per_1m": 14.0,
     },
+    "gpt-5.4": {
+        "input_per_1m": 2.50,
+        "cached_input_per_1m": 0.25,
+        "output_per_1m": 20.0,
+    },
     "gpt-5-mini": {
         "input_per_1m": 0.25,
         "cached_input_per_1m": 0.025,
@@ -44,6 +46,21 @@ DEFAULT_PRICING_TABLE = {
         "input_per_1m": 0.05,
         "cached_input_per_1m": 0.005,
         "output_per_1m": 0.4,
+    },
+    "claude-opus-4-6": {
+        "input_per_1m": 5.0,
+        "cached_input_per_1m": 0.5,
+        "output_per_1m": 25.0,
+    },
+    "claude-sonnet-4-6": {
+        "input_per_1m": 3.0,
+        "cached_input_per_1m": 0.3,
+        "output_per_1m": 15.0,
+    },
+    "claude-haiku-4-5": {
+        "input_per_1m": 1.0,
+        "cached_input_per_1m": 0.1,
+        "output_per_1m": 5.0,
     },
     "web_search": {"tool_calls_per_1k": 10.0},
 }
@@ -117,6 +134,16 @@ def _usage_cache_read_tokens(usage: dict) -> int:
     return 0
 
 
+def _usage_cache_creation_tokens(usage: dict) -> int:
+    details = usage.get("input_token_details") or {}
+    if not isinstance(details, dict):
+        return 0
+    cache_creation = details.get("cache_creation", 0)
+    if isinstance(cache_creation, (int, float)) and cache_creation >= 0:
+        return int(cache_creation)
+    return 0
+
+
 def _iter_tool_calls_from_content(content: Any) -> list[dict]:
     if not isinstance(content, list):
         return []
@@ -135,6 +162,43 @@ def _iter_tool_calls_from_content(content: Any) -> list[dict]:
                 name = getattr(part, "name", None) or getattr(part, "tool_name", None)
                 call_id = getattr(part, "call_id", None) or getattr(part, "id", None)
             calls.append({"name": name, "call_id": call_id})
+        elif part_type == "web_search_call":
+            if isinstance(part, dict):
+                call_id = part.get("id") or part.get("call_id")
+            else:
+                call_id = getattr(part, "id", None) or getattr(part, "call_id", None)
+            calls.append({"name": "web_search", "call_id": call_id})
+    return calls
+
+
+def _iter_tool_calls_from_call_list(tool_calls: Any) -> list[dict]:
+    if not isinstance(tool_calls, list):
+        return []
+    calls = []
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            continue
+        name = _get_tool_call_name(call)
+        call_id = _get_tool_call_id(call)
+        calls.append({"name": name, "call_id": call_id})
+    return calls
+
+
+def _iter_tool_calls_from_message(msg: Any) -> list[dict]:
+    calls = []
+    calls.extend(_iter_tool_calls_from_content(_message_content(msg)))
+    tool_calls_attr = getattr(msg, "tool_calls", None)
+    calls.extend(_iter_tool_calls_from_call_list(tool_calls_attr))
+    additional_kwargs = _message_additional_kwargs(msg)
+    calls.extend(_iter_tool_calls_from_call_list(additional_kwargs.get("tool_calls")))
+    function_call = additional_kwargs.get("function_call")
+    if isinstance(function_call, dict):
+        calls.append(
+            {
+                "name": _get_tool_call_name(function_call),
+                "call_id": _get_tool_call_id(function_call),
+            }
+        )
     return calls
 
 
@@ -193,9 +257,15 @@ def _estimate_cost_for_batch(
                 if input_tokens is None or output_tokens is None:
                     return None, False
                 cache_read = _usage_cache_read_tokens(usage)
-                non_cached_input = max(input_tokens - cache_read, 0)
+                cache_creation = _usage_cache_creation_tokens(usage)
+                regular_input = max(input_tokens - cache_read - cache_creation, 0)
                 cached_input_cost = (cache_read * float(cached_rate)) / 1_000_000.0
-                input_cost = (non_cached_input * float(input_rate)) / 1_000_000.0
+                # Cache writes with 1h TTL cost 2x the base input rate.
+                cache_write_rate = float(input_rate) * 2.0
+                input_cost = (
+                    (cache_creation * cache_write_rate)
+                    + (regular_input * float(input_rate))
+                ) / 1_000_000.0
                 output_cost = (output_tokens * float(output_rate)) / 1_000_000.0
                 reasoning_tokens = 0
                 output_details = usage.get("output_token_details") or {}
@@ -213,7 +283,7 @@ def _estimate_cost_for_batch(
                 costs["output_reasoning_cost_usd"] += output_reasoning_cost
                 costs["output_actual_cost_usd"] += output_actual_cost
 
-            for call in _iter_tool_calls_from_content(_message_content(msg)):
+            for call in _iter_tool_calls_from_message(msg):
                 name = call.get("name")
                 if name != "web_search":
                     continue
@@ -259,13 +329,17 @@ def _estimate_cost_from_state(
     if not isinstance(messages, list):
         return None, None, None, None
 
+    from madagents.backend.constants import REVIEWER_AGENTS
+
     agents_messages = values.get("agents_messages") or {}
+    reviewer_full = values.get("reviewer_full_messages") or {}
     full_messages_map = {
         "orchestrator": values.get("orchestrator_full_messages") or {},
         "planner": values.get("planner_full_messages") or {},
         "plan_updater": values.get("plan_updater_full_messages") or {},
-        "reviewer": values.get("reviewer_full_messages") or {},
     }
+    for rname in REVIEWER_AGENTS:
+        full_messages_map[rname] = reviewer_full
     pricing = _load_pricing_table()
 
     seen_message_ids: set[tuple[str, str]] = set()
@@ -273,6 +347,7 @@ def _estimate_cost_from_state(
     plan_updater_costs = _init_cost_breakdown()
     by_agent_costs: dict[str, dict] = {}
     plan_updater_missing = False
+    plan_updater_had_batches = False
 
     for msg in messages:
         if not _is_ai_message(msg):
@@ -312,6 +387,7 @@ def _estimate_cost_from_state(
             return None, None, None, None
 
         if agent_name == "plan_updater":
+            plan_updater_had_batches = True
             batch_costs, missing_usage = _estimate_cost_for_batch(
                 batch,
                 pricing,
@@ -337,7 +413,7 @@ def _estimate_cost_from_state(
         if any(value for value in plan_updater_costs.values()):
             existing_agent_costs = by_agent_costs.get("plan_updater", _init_cost_breakdown())
             by_agent_costs["plan_updater"] = _merge_cost_breakdown(existing_agent_costs, plan_updater_costs)
-    note = "plan_updater not included" if plan_updater_missing else None
+    note = "plan_updater not included" if (plan_updater_missing and plan_updater_had_batches) else None
     total_cost = (
         total_costs["cached_input_cost_usd"]
         + total_costs["input_cost_usd"]

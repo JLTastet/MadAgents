@@ -5,6 +5,7 @@ import {
   SELECTED_THREAD_ID_KEY,
   darkTheme,
   lightTheme,
+  inferProviderFromModel,
   WORKER_AGENTS,
 } from "./lib/constants";
 import { stripControlChars } from "./lib/formatters";
@@ -91,7 +92,6 @@ function App() {
     selectedThreadId && selectedThreadId !== "-1"
       ? rewindStatusByThread[selectedThreadId] || "pending"
       : null;
-
   const scrollContainerRef = useRef(null);
   const [autoScroll, setAutoScroll] = useState(true);
   const eventSourceRef = useRef(null);
@@ -528,14 +528,18 @@ function App() {
   const updateAgentField = (agentName, field, value) => {
     setConfigDraft((prev) => {
       if (!prev || !prev.agents || !prev.agents[agentName]) return prev;
+      const nextAgent = {
+        ...prev.agents[agentName],
+        [field]: value,
+      };
+      if (field === "model") {
+        nextAgent.provider = inferProviderFromModel(value);
+      }
       return {
         ...prev,
         agents: {
           ...prev.agents,
-          [agentName]: {
-            ...prev.agents[agentName],
-            [field]: value,
-          },
+          [agentName]: nextAgent,
         },
       };
     });
@@ -546,6 +550,7 @@ function App() {
     const nextModel = workerGroup.model || null;
     const nextVerbosity = workerGroup.verbosity || null;
     const nextStepLimit = parsePositiveInt(workerGroup.step_limit);
+    const nextProvider = nextModel ? inferProviderFromModel(nextModel) : null;
 
     setConfigDraft((prev) => {
       if (!prev || !prev.agents) return prev;
@@ -556,6 +561,7 @@ function App() {
         agents[agentName] = {
           ...agentCfg,
           ...(nextModel ? { model: nextModel } : {}),
+          ...(nextProvider ? { provider: nextProvider } : {}),
           ...(nextVerbosity ? { verbosity: nextVerbosity } : {}),
           ...(agentCfg.supports_step_limit && nextStepLimit
             ? { step_limit: nextStepLimit }
@@ -624,8 +630,13 @@ function App() {
   };
 
   const downloadFromEndpoint = async (url, fallbackName) => {
-    const res = await fetch(url);
-    return downloadResponse(res, fallbackName);
+    try {
+      const res = await fetch(url);
+      return downloadResponse(res, fallbackName);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Download failed");
+      return false;
+    }
   };
 
   const fetchRuns = async (options = {}) => {
@@ -1301,12 +1312,144 @@ function App() {
     while (i < decoratedMessages.length) {
       const m = decoratedMessages[i];
 
-      // 1) orchestrator -> agent group
+      // 1) orchestrator -> agent group (single or parallel)
       if (m.name === "orchestrator") {
         const addContent = m.add_content || {};
+        const dispatches = addContent.dispatches || [];
         const recipient = addContent.recipient || "";
 
+        // Multi-dispatch: parallel agent groups
+        if (dispatches.length > 1) {
+          // Build composite keys (recipient:instance_id) to handle
+          // multiple instances of the same agent type in parallel.
+          const dispatchKeys = [];
+          const recipientNames = new Set();
+          const instructionByKey = {};
+          for (const d of dispatches) {
+            if (!isAgentName(d.recipient)) continue;
+            const iid = d.instance_id;
+            const key = iid != null ? `${d.recipient}:${iid}` : d.recipient;
+            dispatchKeys.push({ key, recipient: d.recipient, instanceId: iid });
+            recipientNames.add(d.recipient);
+            instructionByKey[key] = {
+              recipient: d.recipient,
+              reasoning: "",
+              message: d.message || "",
+              reasoning_effort: d.reasoning_effort || "",
+              future_note: "",
+              model: d.model || "",
+            };
+          }
+          const pendingKeys = new Set(dispatchKeys.map((dk) => dk.key));
+
+          i++;
+
+          // Collect inline messages (e.g. plan_updater) between orchestrator and agents
+          const rawInlineMessages = [];
+          while (
+            i < decoratedMessages.length &&
+            !recipientNames.has(decoratedMessages[i].name) &&
+            decoratedMessages[i].name !== "orchestrator" &&
+            decoratedMessages[i].name !== "user"
+          ) {
+            rawInlineMessages.push(decoratedMessages[i]);
+            i++;
+          }
+
+          // Plan updates should appear as separate top-level items, not inside the agent group
+          const inlineMessages = [];
+          for (const msg of rawInlineMessages) {
+            if (msg.name === "plan_updater") {
+              result.push({ type: "message", message: msg });
+            } else {
+              inlineMessages.push(msg);
+            }
+          }
+
+          // Collect all subsequent messages that belong to ANY dispatched agent
+          const agentGroups = {};
+          // Build bare-name → composite-key fallback for traces without instance_id
+          const bareNameToKeys = {};
+          for (const dk of dispatchKeys) {
+            agentGroups[dk.key] = { traces: [], mainMessage: null };
+            if (!bareNameToKeys[dk.recipient]) bareNameToKeys[dk.recipient] = [];
+            bareNameToKeys[dk.recipient].push(dk.key);
+          }
+
+          while (i < decoratedMessages.length) {
+            const next = decoratedMessages[i];
+            if (!recipientNames.has(next.name)) break;
+            // Determine composite key for this message
+            const nextIid = next.add_content?.instance_id;
+            const nextKey = nextIid != null ? `${next.name}:${nextIid}` : next.name;
+            // Try composite key, then bare name, then first pending dispatch for this agent
+            let matchKey;
+            if (agentGroups[nextKey]) {
+              matchKey = nextKey;
+            } else {
+              const candidates = bareNameToKeys[next.name] || [];
+              matchKey = candidates.find((k) => pendingKeys.has(k)) || candidates[0];
+            }
+            const group = matchKey ? agentGroups[matchKey] : null;
+            if (!group) break;
+            if (next.add_content && next.add_content.exec_trace) {
+              group.traces.push(next);
+              i++;
+            } else {
+              group.mainMessage = next;
+              i++;
+              // After a main message, stop collecting for this dispatch
+              pendingKeys.delete(matchKey);
+              // Remove from recipientNames only when ALL instances of this name are done
+              const stillPending = [...pendingKeys].some((k) => k === next.name || k.startsWith(next.name + ":"));
+              if (!stillPending) recipientNames.delete(next.name);
+              if (pendingKeys.size === 0) break;
+            }
+          }
+
+          const subGroups = dispatchKeys.map((dk, dkIdx) => ({
+            agentName: dk.recipient,
+            instanceId: dk.instanceId,
+            traces: agentGroups[dk.key]?.traces || [],
+            mainMessage: agentGroups[dk.key]?.mainMessage || null,
+            instruction: instructionByKey[dk.key],
+            inlineMessages: dkIdx === 0 ? inlineMessages : [],
+          }));
+
+          result.push({
+            type: "parallelAgentOpGroup",
+            orchestratorMessage: m,
+            subGroups,
+            inlineMessages,
+          });
+          continue;
+        }
+
+        // Self-dispatch (e.g. UpdatePlan tool call, recipient is "orchestrator")
+        // Group with following inline messages (plan_updater etc.) and show content directly.
+        if (recipient === "orchestrator") {
+          i++;
+          const inlineMessages = [];
+          while (
+            i < decoratedMessages.length &&
+            decoratedMessages[i].name !== "orchestrator" &&
+            decoratedMessages[i].name !== "user"
+          ) {
+            inlineMessages.push(decoratedMessages[i]);
+            i++;
+          }
+          result.push({
+            type: "orchestratorUpdate",
+            message: m,
+            inlineMessages,
+          });
+          continue;
+        }
+
+        // Single dispatch
         if (!isOrchestratorToUser(recipient) && isAgentName(recipient)) {
+          const singleDispatch = dispatches.length === 1 ? dispatches[0] : null;
+          const singleInstanceId = singleDispatch?.instance_id ?? null;
           const instructionMessage = addContent.message ? addContent.message : m.content;
           const instruction = {
             recipient,
@@ -1314,9 +1457,33 @@ function App() {
             message: instructionMessage,
             reasoning_effort: addContent.reasoning_effort || "",
             future_note: addContent.future_note || "",
+            model: singleDispatch?.model || "",
           };
 
           i++;
+
+          // Collect inline messages (e.g. plan_updater) between orchestrator and agent
+          const rawInlineMessages = [];
+          while (
+            i < decoratedMessages.length &&
+            decoratedMessages[i].name !== recipient &&
+            decoratedMessages[i].name !== "orchestrator" &&
+            decoratedMessages[i].name !== "user"
+          ) {
+            rawInlineMessages.push(decoratedMessages[i]);
+            i++;
+          }
+
+          // Plan updates should appear as separate top-level items, not inside the agent group
+          const inlineMessages = [];
+          for (const msg of rawInlineMessages) {
+            if (msg.name === "plan_updater") {
+              result.push({ type: "message", message: msg });
+            } else {
+              inlineMessages.push(msg);
+            }
+          }
+
           const traces = [];
 
           while (
@@ -1340,12 +1507,19 @@ function App() {
             i++;
           }
 
+          // Orchestrator's own content text (user-facing commentary, distinct from dispatch instruction).
+          const orchestratorContent =
+            typeof m.content === "string" ? m.content : "";
+
           result.push({
             type: "agentOpGroup",
             agentName: recipient,
+            instanceId: singleInstanceId,
             traces,
             mainMessage,
             instruction,
+            inlineMessages,
+            orchestratorContent,
           });
           continue;
         }
@@ -1380,6 +1554,7 @@ function App() {
         result.push({
           type: "agentOpGroup",
           agentName,
+          instanceId: mainMessage?.add_content?.instance_id ?? null,
           traces,
           mainMessage,
         });

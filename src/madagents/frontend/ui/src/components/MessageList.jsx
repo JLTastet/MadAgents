@@ -8,6 +8,7 @@ import {
   PlanCard,
   PlanUpdatesCard,
   renderPlanLabel,
+  renderPlanUpdateLabel,
 } from "./PlanCard";
 
 /**
@@ -57,19 +58,131 @@ const MessageList = memo(function MessageList({
 
         {processedMessages.map((item, idx) => {
           if (item.type === "agentOpGroup") {
+            const groupOrchestratorContent = stripControlChars(
+              item.orchestratorContent || ""
+            );
             return (
-              <AgentOpGroup
-                key={`agent-group-${idx}`}
-                group={item}
-                theme={theme}
-              />
+              <React.Fragment key={`agent-group-${idx}`}>
+                {groupOrchestratorContent.trim() && (
+                  <MarkdownBubble isUser={false} theme={theme}>
+                    {groupOrchestratorContent}
+                  </MarkdownBubble>
+                )}
+                <AgentOpGroup group={item} theme={theme} />
+              </React.Fragment>
+            );
+          }
+
+          if (item.type === "orchestratorUpdate") {
+            const om = item.message;
+            const omRaw =
+              typeof om.content === "string"
+                ? om.content
+                : om.content == null
+                  ? ""
+                  : JSON.stringify(om.content, null, 2);
+            const omText = stripControlChars(omRaw);
+            const omAdd = om.add_content || {};
+            const omReasoning = stripControlChars(omAdd.reasoning || "");
+            return (
+              <div
+                key={`orch-update-${idx}`}
+                style={{
+                  alignSelf: "flex-start",
+                  maxWidth: "80%",
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "0.15rem",
+                  boxSizing: "border-box",
+                }}
+              >
+                <OrchestratorReasoningBlock
+                  reasoning={omReasoning}
+                  futureNote=""
+                  theme={theme}
+                />
+                {omText.trim() && (
+                  <MarkdownBubble
+                    isUser={false}
+                    theme={theme}
+                    showCopy={true}
+                    copyText={omText}
+                  >
+                    {omText}
+                  </MarkdownBubble>
+                )}
+                {(item.inlineMessages || []).map((msg, inlineIdx) => {
+                  const inlineAddContent = msg.add_content || {};
+                  const inlinePlan = inlineAddContent.plan;
+                  const inlinePlanUpdateSteps = Array.isArray(
+                    inlineAddContent.plan_update_steps
+                  )
+                    ? inlineAddContent.plan_update_steps
+                    : [];
+                  if (inlinePlanUpdateSteps.length > 0) {
+                    return (
+                      <ReplyAccordion
+                        key={`inline-${inlineIdx}`}
+                        theme={theme}
+                        defaultOpen={true}
+                        label={renderPlanUpdateLabel(inlinePlanUpdateSteps, theme, inlinePlan)}
+                      >
+                        <PlanUpdatesCard
+                          steps={inlinePlanUpdateSteps}
+                          theme={theme}
+                          showStatusIcons={false}
+                        />
+                      </ReplyAccordion>
+                    );
+                  }
+                  if (inlinePlan && Array.isArray(inlinePlan.steps)) {
+                    return (
+                      <ReplyAccordion
+                        key={`inline-${inlineIdx}`}
+                        theme={theme}
+                        defaultOpen={false}
+                        label={renderPlanLabel(inlinePlan, theme)}
+                      >
+                        <PlanCard plan={inlinePlan} theme={theme} />
+                      </ReplyAccordion>
+                    );
+                  }
+                  return null;
+                })}
+              </div>
+            );
+          }
+
+          if (item.type === "parallelAgentOpGroup") {
+            const parallelOrchestratorContent = (() => {
+              const om = item.orchestratorMessage;
+              if (!om) return "";
+              const raw = typeof om.content === "string" ? om.content : "";
+              return stripControlChars(raw);
+            })();
+            return (
+              <React.Fragment key={`parallel-group-${idx}`}>
+                {parallelOrchestratorContent.trim() && (
+                  <MarkdownBubble isUser={false} theme={theme}>
+                    {parallelOrchestratorContent}
+                  </MarkdownBubble>
+                )}
+                {(item.subGroups || []).map((subGroup, subIdx) => (
+                  <AgentOpGroup
+                    key={`parallel-sub-${idx}-${subIdx}`}
+                    group={subGroup}
+                    theme={theme}
+                  />
+                ))}
+              </React.Fragment>
             );
           }
 
           const m = item.message;
           const isUser = m.name === "user";
           const isOrchestrator = m.name === "orchestrator";
-          const displayName = getRecipientDisplayName(m.name || "assistant");
+          const msgInstanceId = m.add_content?.instance_id;
+          const displayName = getRecipientDisplayName(m.name || "assistant", msgInstanceId);
 
           const addContent = m.add_content || {};
           const plan = addContent.plan;
@@ -85,7 +198,7 @@ const MessageList = memo(function MessageList({
                 : JSON.stringify(m.content, null, 2);
           const contentText = stripControlChars(rawContentText);
           const hasContent = contentText.trim().length > 0;
-          const orchestratorRecipient = isOrchestrator ? addContent.recipient : "";
+          const orchestratorRecipient = isOrchestrator ? (addContent.recipient || "") : "";
           const orchestratorRecipientDisplay = getRecipientDisplayName(
             orchestratorRecipient
           );
@@ -97,9 +210,14 @@ const MessageList = memo(function MessageList({
             isOrchestrator && typeof addContent.future_note === "string"
               ? stripControlChars(addContent.future_note)
               : "";
-          const orchestratorMessage = stripControlChars(
-            isOrchestrator && addContent.message ? addContent.message : contentText
+          const orchestratorInstruction = stripControlChars(
+            isOrchestrator && addContent.message ? addContent.message : ""
           );
+          // User-facing text from the orchestrator (shown outside the accordion)
+          const orchestratorContentText =
+            isOrchestrator && addContent.message ? contentText : "";
+          // For user-directed messages (no dispatch), show content directly
+          const orchestratorMessage = orchestratorInstruction || contentText;
           const isPlannerReply =
             m.name === "planner" || m.name === "plan_updater";
           const showPlanUpdates =
@@ -111,6 +229,10 @@ const MessageList = memo(function MessageList({
               orchestratorRecipient === "end_user" ||
               orchestratorRecipient === "");
 
+          // User-facing: no explicit recipient in add_content (recipient is "")
+          // Legacy messages may have explicit recipient "user" or "end_user"
+          const isImplicitOrchestratorToUser =
+            isOrchestrator && isOrchestratorToUser && !orchestratorRecipient;
           const orchestratorFoldable = isOrchestrator && !isOrchestratorToUser;
           const showOrchestratorEffort =
             isOrchestrator && !isOrchestratorToUser && Boolean(orchestratorEffort);
@@ -147,7 +269,7 @@ const MessageList = memo(function MessageList({
                 width: isEditingRewind ? "100%" : "auto",
                 display: "flex",
                 flexDirection: "column",
-                gap: isOrchestrator ? "0.05rem" : "0.15rem",
+                gap: (isOrchestrator && !isImplicitOrchestratorToUser) ? "0.05rem" : "0.15rem",
                 boxSizing: "border-box",
               }}
             >
@@ -164,7 +286,7 @@ const MessageList = memo(function MessageList({
                 </div>
               )}
 
-              {isOrchestrator && (
+              {isOrchestrator && !isImplicitOrchestratorToUser && (
                 <div
                   style={{
                     fontSize: "0.8rem",
@@ -256,7 +378,7 @@ const MessageList = memo(function MessageList({
                       disabled={isRewinding || rewindDisabled}
                       style={{
                         border: "none",
-                        background: "#1d4ed8",
+                        background: theme.accentDark,
                         color: "white",
                         borderRadius: "999px",
                         padding: "0.35rem 0.85rem",
@@ -272,6 +394,11 @@ const MessageList = memo(function MessageList({
               ) : isOrchestrator ? (
                 orchestratorFoldable ? (
                   <>
+                    {orchestratorContentText.trim() && (
+                      <MarkdownBubble isUser={false} theme={theme}>
+                        {orchestratorContentText}
+                      </MarkdownBubble>
+                    )}
                     <ReplyAccordion theme={theme} defaultOpen={false} label="Instruction">
                       <OrchestratorReasoningBlock
                         reasoning={orchestratorReasoning}
@@ -280,7 +407,7 @@ const MessageList = memo(function MessageList({
                       />
 
                       <MarkdownBubble isUser={false} theme={theme}>
-                        {orchestratorMessage}
+                        {orchestratorInstruction}
                       </MarkdownBubble>
                     </ReplyAccordion>
                   </>
@@ -320,7 +447,7 @@ const MessageList = memo(function MessageList({
                       <PlanCard plan={plan} theme={theme} />
                     </ReplyAccordion>
                   )}
-                  {hasContent &&
+                  {hasContent && !showPlanUpdates &&
                     (shouldAccordionWrap ? (
                       <ReplyAccordion theme={theme} defaultOpen={isPlannerReply}>
                         <MarkdownBubble
@@ -363,7 +490,7 @@ const MessageList = memo(function MessageList({
       {error && (
         <div
           style={{
-            color: "#fca5a5",
+            color: theme.errorText,
             fontSize: "0.9rem",
             padding: "0 1rem 0.5rem",
           }}

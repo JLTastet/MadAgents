@@ -140,10 +140,16 @@ async def extract_message_history(
             if isinstance(agent_batches, dict) and message_id:
                 batch = agent_batches.get(message_id)
                 if batch:
+                    trace_instance_id = additional_kwargs.get("instance_id") if isinstance(additional_kwargs, dict) else None
                     for sub_msg in batch:
                         if isinstance(sub_msg, HumanMessage):
                             continue
-                        history.extend(get_exec_trace_messages(agent_name, sub_msg))
+                        traces = get_exec_trace_messages(agent_name, sub_msg)
+                        if trace_instance_id is not None:
+                            for t in traces:
+                                if isinstance(t, dict) and isinstance(t.get("add_content"), dict):
+                                    t["add_content"]["instance_id"] = trace_instance_id
+                        history.extend(traces)
 
         payload = {
             "content": response_to_text(msg),

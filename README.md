@@ -9,6 +9,15 @@ This is the **official implementation** of **MadAgents**.
 
 ---
 
+## Changelog 🔥
+
+- **[26/03/20]** Released **Claude Code implementation** — run MadAgents as a multi-agent system directly from the terminal, works with a Claude subscription, no API credits needed! See [Quick start (Claude Code)](#quick-start-claude-code). 🔥
+- **[26/03/20]** Added **Anthropic model support** (Claude Opus 4.6, Sonnet 4.6, Haiku 4.5) — switch between OpenAI and Anthropic directly from the UI!
+- **[26/03/20]** New **physics expert** worker for HEP theory and phenomenology, plus **three specialized reviewers** (plan, verification, presentation) for higher-quality answers!
+- **[26/03/20]** **Parallel worker dispatch** — the orchestrator now runs multiple workers concurrently, with full agent traces and an expanded MadGraph documentation library.
+
+---
+
 ## What can I do with MadAgents?
 
 MadAgents is a set of **communicative agents** that support **MadGraph-centered HEP workflows**, including:
@@ -20,14 +29,64 @@ MadAgents is a set of **communicative agents** that support **MadGraph-centered 
 
 ---
 
-## Quick start
+## Two ways to run MadAgents
+
+MadAgents can be used in two modes. Both run inside an Apptainer container.
+
+| | Claude Code | API version |
+| --- | --- | --- |
+| **Interface** | Terminal (CLI) | Web UI (browser) |
+| **Backend** | Claude Code multi-agent system | LangGraph + FastAPI |
+| **Setup** | Claude Code CLI + Apptainer | API keys + Apptainer |
+| **Authentication** | Claude subscription or API credits | OpenAI / Anthropic API keys |
+| **Session management** | `--resume` / `--continue` flags | Browser-based |
+
+---
+
+## Quick start (Claude Code)
 
 ### 0) Requirements
 
 - **Linux host** (or a Linux VM on Windows/macOS, see [Install Apptainer](#install-apptainer))
-- **Apptainer** installed on the host (see [Install Apptainer](#install-apptainer))
-- **OpenAI API key** (currently the only supported provider)
-- **Network access** to OpenAI endpoints
+- **[Apptainer](https://apptainer.org/)** installed on the host (see [Install Apptainer](#install-apptainer))
+- **[Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)** installed and authenticated (works with a Claude subscription or API credits)
+
+### 1) Get the code
+
+Clone or download this repository.
+
+### 2) Build image + overlay
+
+```bash
+# Preinstalled MadGraph stack (ROOT, Pythia8, Delphes)
+./image/create_image.sh --type preinstall
+```
+
+See [Build image](#build-image) for more options.
+
+### 3) Run
+
+```bash
+./madrun_code.sh
+```
+
+To resume or continue a previous session:
+
+```bash
+./madrun_code.sh --resume              # Pick from past sessions
+./madrun_code.sh --continue            # Continue most recent session
+```
+
+---
+
+## Quick start (API version)
+
+### 0) Requirements
+
+- **Linux host** (or a Linux VM on Windows/macOS, see [Install Apptainer](#install-apptainer))
+- **[Apptainer](https://apptainer.org/)** installed on the host (see [Install Apptainer](#install-apptainer))
+- **OpenAI or Anthropic API key**
+- **Network access** to OpenAI/Anthropic endpoints
 
 ### 1) Get the code
 
@@ -38,7 +97,9 @@ Clone or download this repository.
 Copy `config.env.example` to `config.env` in the repo root, then edit:
 
 ```dotenv
-LLM_API_KEY="your-openai-key"
+OPENAI_API_KEY="your-openai-key"
+ANTHROPIC_API_KEY="your-anthropic-key"
+LLM_API_KEY=""
 APPTAINER_DIR="/path/to/apptainer/bin"
 ```
 
@@ -61,22 +122,22 @@ Creates:
 ### 4) Run
 
 ```bash
-./madrun.sh
+./madrun_api.sh
 ```
 
 By default, the output is written to `./output` in the repository root.
 
-`madrun.sh` handles cleanup on exit. `madrun_cleanup.sh` is an optional cleanup helper you can run at any time, but it is usually unnecessary unless a run is stuck or your terminal died:
+Both `madrun_api.sh` and `madrun_code.sh` handle cleanup on exit. `cleanup_madrun.sh` is an optional cleanup helper that works for both and can be run at any time, but it is usually unnecessary unless a run is stuck or your terminal died:
 
 ```bash
-./madrun_cleanup.sh
+./cleanup_madrun.sh
 ```
 
 ---
 
-## Startup output (what you should see)
+## Startup output — API version (what you should see)
 
-When you run `./madrun.sh`, the CLI should look like:
+When you run `./madrun_api.sh` (from the repo root), the CLI should look like:
 
 ```
 Starting MadAgents ...
@@ -106,45 +167,63 @@ If installation is **not possible in your environment** (e.g., required kernel f
 
 ## Configuration
 
-All scripts read `config.env` from the repo root. Relative paths are resolved from the repo root.
+Both modes read `config.env` from the repo root. Relative paths are resolved from the repo root.
 Use `config.env.example` as the template if `config.env` is missing.
 
-Model defaults:
-- Agents use GPT‑5.1 models by default, except the Plan‑Updater which uses GPT‑5‑mini.
-- You can change all model selections from the UI.
+### Global settings (both modes)
 
-### Required
-
-- `LLM_API_KEY` — OpenAI API key used by the agents (**only OpenAI models are supported**).
 - `APPTAINER_DIR` — directory containing the `apptainer` binary (required by `image/create_image.sh`).
-
-### Optional (defaults shown)
-
 - `OUTPUT_DIR` — outputs folder (`output`)
 - `RUN_DIR` — runtime folder for logs, locks, sockets (`run_dir`)
+
+### API version
+
+#### Required
+
+Provide at least one API key; provider-specific keys take precedence over `LLM_API_KEY`.
+
+- `OPENAI_API_KEY` — OpenAI API key (preferred for OpenAI models if set).
+- `ANTHROPIC_API_KEY` — Anthropic API key (preferred for Anthropic models if set).
+- `LLM_API_KEY` — fallback API key when provider-specific keys are not set.
+
+#### Optional (defaults shown)
+
 - `FRONTEND_PORT` — UI port (`5173`)
 - `BACKEND_PORT` — API port (`8000`)
 - `APPTAINER_CACHEDIR` — Apptainer cache (`.apptainer/cache`)
 - `APPTAINER_CONFIGDIR` — Apptainer config (`.apptainer`)
 - `NPM_CONFIG_CACHE` — npm cache (`.npm`)
 
-### Minimal example
+#### Model defaults
+
+- Agents use GPT‑5.1 models by default, except the Plan‑Updater which uses GPT‑5‑mini.
+- You can change all model selections from the UI; provider is inferred from the model name (`gpt-*` → OpenAI, `claude-*` → Anthropic).
+
+#### Minimal example
 
 ```dotenv
-LLM_API_KEY="your-openai-key-here"
+OPENAI_API_KEY="your-openai-key-here"
+ANTHROPIC_API_KEY=""
+LLM_API_KEY=""
 APPTAINER_DIR="/path/to/apptainer"
 ```
 
-### Temporary overrides (CLI)
+#### Temporary overrides (CLI)
 
-You can override values from `config.env` for a single run by passing flags to `madrun.sh`:
+You can override values from `config.env` for a single run by passing flags to `madrun_api.sh`:
 
 ```bash
-./madrun.sh --frontend_port 5173 --backend_port 8000
-./madrun.sh --output_dir /tmp/madagents_out --run_dir /tmp/madagents_run
+./madrun_api.sh --frontend_port 5173 --backend_port 8000
+./madrun_api.sh --output_dir /tmp/madagents_out --run_dir /tmp/madagents_run
 ```
 
-Run `./madrun.sh --help` for the full list of supported flags.
+Run `./madrun_api.sh --help` for the full list of supported flags.
+
+### Claude Code version
+
+Claude Code handles its own authentication; API keys from `config.env` are not used.
+
+- `CLAUDE_CONFIG_DIR` — Claude Code configuration directory (`claude_code/.config/.claude`)
 
 ---
 
@@ -179,11 +258,11 @@ any existing files with the same names.
 
 ## Stop / cleanup
 
-`madrun.sh` traps exit signals and stops the Apptainer instance for you.
-`madrun_cleanup.sh` is safe to run at any time, but it is usually unnecessary unless the process is wedged or your terminal died:
+Both `madrun_api.sh` and `madrun_code.sh` trap exit signals and stop the Apptainer instance automatically.
+`cleanup_madrun.sh` is safe to run at any time for either variant, but it is usually unnecessary unless the process is wedged or your terminal died:
 
 ```bash
-./madrun_cleanup.sh
+./cleanup_madrun.sh
 ```
 
 Manual fallback:
@@ -193,7 +272,7 @@ apptainer instance list
 apptainer instance stop INSTANCE_NAME
 ```
 
-The `INSTANCE_NAME` is recorded in `run_dir/logs/instance_name.txt` and is usually `madagents`.
+The `INSTANCE_NAME` is recorded in `run_dir/logs/instance_name.txt` (API version) or `run_dir/workdirs/<stamp>/logs/instance_name.txt` (Claude Code version) and is usually `madagents` or `madagents-cc`.
 
 ---
 
@@ -205,7 +284,7 @@ The `INSTANCE_NAME` is recorded in `run_dir/logs/instance_name.txt` and is usual
   persist across runs until you rebuild or delete the overlay.
 
 Want a “clean slate” run?
-1. Stop the instance (`./madrun_cleanup.sh`)
+1. Stop the instance (`./cleanup_madrun.sh`)
 2. Delete the overlay (`rm image/mad_overlay.img`)
 3. Recreate it (`./image/create_overlay.sh`), and optionally rebuild the `.sif`
 

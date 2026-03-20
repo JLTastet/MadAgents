@@ -67,12 +67,21 @@ async def _backend_main_async(
                 await server.serve()
         except Exception as ex:
             traceback.print_exc()
-            print("Please crashed, please close the application.")
+            print("Process crashed, please close the application.")
         finally:
-            if app is not None and app.state.madgraph_handle is not None:
-                from madagents.cli_bridge.bridge_handle import stop_bridge
-
-                stop_bridge(app.state.madgraph_handle)
+            if app is not None:
+                chat_task = getattr(app.state, "chat_worker_task", None)
+                if chat_task is not None and not chat_task.done():
+                    chat_task.cancel()
+                    try:
+                        await chat_task
+                    except BaseException:
+                        pass
+                if app.state.agent is not None:
+                    try:
+                        app.state.agent.close()
+                    except Exception:
+                        pass
 
 
 def parse_args() -> argparse.Namespace:

@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import contextvars
 import os
 from typing import Optional
 import re
@@ -15,6 +16,13 @@ from madagents.cli_bridge.bridge_handle import (
     stop_bridge,
 )
 
+# Context variable used by CLISessionManager to route calls to the correct
+# per-instance CLISession.  Worker executor nodes set this before invoking
+# the worker subgraph.
+_current_cli_instance_id: contextvars.ContextVar[int] = contextvars.ContextVar(
+    '_current_cli_instance_id', default=0
+)
+
 @dataclass
 class CLISession:
     """Session wrapper around a CLI bridge and its transcript."""
@@ -24,6 +32,7 @@ class CLISession:
     dir: Optional[str] = None
     finished: bool = False
     cmd_script: Optional[str] = None
+    lazy: bool = False
 
     def __post_init__(self):
         """Resolve handle/dir defaults and ensure a bridge is available."""
@@ -35,7 +44,8 @@ class CLISession:
                 raise ValueError("The directory of the bridge must be set!")
             if self.cmd_script is None:
                 self.cmd_script = "bash"
-        self._ensure_handle()
+        if not self.lazy:
+            self._ensure_handle()
 
     def read_output(
         self,
@@ -59,7 +69,6 @@ class CLISession:
             self.read_offset = new_offset
             cli_chunk = chunk.decode("utf-8", errors="ignore") if chunk else ""
             cli_chunk = strip_control_codes(cli_chunk)
-            # cli_chunk = smart_strip_control_codes(cli_chunk)
             return cli_chunk
 
         except TimeoutError as exc:
@@ -169,6 +178,49 @@ class CLISession:
         text = strip_control_codes(selected.decode("utf-8", errors="replace"))
         return text, start_line, end_line
 
+
+class CLISessionManager:
+    """Proxy that routes CLISession calls to per-instance sessions with lazy bridge spawning.
+
+    Tools that close over a CLISession can instead receive a CLISessionManager.
+    ``__getattr__`` transparently delegates attribute/method access to the
+    current instance's session (determined by ``_current_cli_instance_id``),
+    so no changes to tool factories are needed.
+    """
+
+    def __init__(self, base_dir: str, cli_cmd: str = "bash", name_prefix: str = "cli"):
+        self._base_dir = base_dir
+        self._cli_cmd = cli_cmd
+        self._name_prefix = name_prefix
+        self._sessions: dict[int, CLISession] = {}
+
+    def get_session(self, instance_id: Optional[int] = None) -> CLISession:
+        """Return (lazily creating) the CLISession for *instance_id*."""
+        if instance_id is None:
+            instance_id = _current_cli_instance_id.get()
+        if instance_id not in self._sessions:
+            self._sessions[instance_id] = CLISession(
+                name=f"{self._name_prefix}_{instance_id}",
+                dir=os.path.join(self._base_dir, str(instance_id)),
+                cmd_script=self._cli_cmd,
+                lazy=True,
+            )
+        return self._sessions[instance_id]
+
+    def __getattr__(self, name):
+        """Proxy attribute/method access to the current instance's session."""
+        return getattr(self.get_session(), name)
+
+    def close_all(self):
+        """Terminate all managed bridge sessions."""
+        for session in self._sessions.values():
+            try:
+                session.finish()
+            except Exception:
+                pass
+        self._sessions.clear()
+
+
 ANSI_ESCAPE_RE = re.compile(
     r'''
     \x1B  # ESC
@@ -196,33 +248,3 @@ def strip_control_codes(s: str, keep_newlines: bool = True) -> str:
         s = re.sub(r'[\x00-\x1F\x7F]', '', s)
 
     return s
-
-# TODO: I don't think this is right, for instance \r\n would be handled wrong!
-def smart_strip_control_codes(text: str) -> str:
-    """Attempt to normalize output with carriage returns and blank lines."""
-    current = ""
-    last_was_blank = True
-    
-    text = strip_control_codes(text, keep_newlines=True)
-
-    out_lines: list[str] = []
-
-    for ch in text:
-        if ch == "\r":
-            current = ""
-        elif ch == "\n":
-            # finalize a line
-            line = current.rstrip()
-            is_blank = (line == "")
-            if not is_blank or not last_was_blank:
-                out_lines.append(line + "\n")
-            last_was_blank = is_blank
-            current = ""
-        else:
-            current += ch
-    if current:
-        out_lines.append(current)
-
-    if not out_lines:
-        return b""
-    return "".join(out_lines)
