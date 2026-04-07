@@ -78,6 +78,26 @@ To resume or continue a previous session:
 ./madrun_code.sh --continue            # Continue most recent session
 ```
 
+> Tip: any `config.env` value can be overridden for a single run via an environment variable, e.g. `ENABLE_DOC_EDITING=1 ./madrun_code.sh`. See [Temporary overrides](#temporary-overrides-environment-variables).
+
+---
+
+## Self-improving docs
+
+MadAgents can improve its own MadGraph documentation. Enable doc-editing mode and ask the instance to guide you through it:
+
+```bash
+ENABLE_DOC_EDITING=1 ./madrun_code.sh
+```
+
+```
+> How can I improve the MadGraph documentation?
+```
+
+See [`claude_code/README.md`](claude_code/README.md) for the doc-editing skills the instance has access to.
+
+For automated, batch-style runs (e.g. CI, overnight evaluations), use the host-side Python pipeline at [`eval/`](eval/) instead.
+
 ---
 
 ## Quick start (API version)
@@ -134,6 +154,8 @@ Both `madrun_api.sh` and `madrun_code.sh` handle cleanup on exit. `cleanup_madru
 ./cleanup_madrun.sh
 ```
 
+> Tip: any `config.env` value can be overridden for a single run via an environment variable, e.g. `FRONTEND_PORT=6000 ./madrun_api.sh`. See [Temporary overrides](#temporary-overrides-environment-variables).
+
 ---
 
 ## Startup output — API version (what you should see)
@@ -148,24 +170,6 @@ Apptainer>
 ```
 
 If you don’t see this output, check out [Troubleshooting](#troubleshooting).
-
----
-
-## Self-improving docs
-
-MadAgents can improve its own MadGraph documentation. Enable doc-editing mode and ask the instance to guide you through it:
-
-```bash
-ENABLE_DOC_EDITING=1 ./madrun_code.sh
-```
-
-```
-> How can I improve the MadGraph documentation?
-```
-
-See [`claude_code/README.md`](claude_code/README.md) for the doc-editing skills the instance has access to.
-
-For automated, batch-style runs (e.g. CI, overnight evaluations), use the host-side Python pipeline at [`eval/`](eval/) instead.
 
 ---
 
@@ -227,17 +231,6 @@ LLM_API_KEY=""
 APPTAINER_DIR="/path/to/apptainer"
 ```
 
-#### Temporary overrides (environment variables)
-
-You can override any `config.env` value for a single run by setting the variable in the caller environment. Precedence: **caller env > config.env > script defaults**.
-
-```bash
-FRONTEND_PORT=6000 BACKEND_PORT=9000 ./madrun_api.sh
-OUTPUT_DIR=/tmp/madagents_out ./madrun_code.sh
-```
-
-This works for both `madrun_api.sh` and `madrun_code.sh`.
-
 ### Claude Code version
 
 Claude Code handles its own authentication; API keys from `config.env` are not used.
@@ -247,6 +240,16 @@ Claude Code handles its own authentication; API keys from `config.env` are not u
 - `ENABLE_DOC_EDITING` — enable documentation editing skills and agent teams, implies verify (`0`)
 
 See [claude_code/README.md](claude_code/README.md) for details on the available modes, skills, and documentation improvement workflows.
+
+### Temporary overrides (environment variables)
+
+Any value in `config.env` can be overridden for a single run by setting the variable in the caller environment. This works for both `madrun_api.sh` and `madrun_code.sh`. Precedence: **caller env > config.env > script defaults**.
+
+```bash
+FRONTEND_PORT=6000 BACKEND_PORT=9000 ./madrun_api.sh
+OUTPUT_DIR=/tmp/madagents_out ./madrun_code.sh
+ENABLE_DOC_EDITING=1 ./madrun_code.sh
+```
 
 ---
 
