@@ -58,8 +58,10 @@ if [[ -z "${APPTAINER_BIN}" || ! -x "${APPTAINER_BIN}" ]]; then
 fi
 
 # ── Validate image and overlay ──────────────────────────────────────
-IMAGE="${SCRIPT_DIR}/image/madagents.sif"
-OVERLAY="${SCRIPT_DIR}/image/mad_overlay.img"
+IMAGE="${APPTAINER_IMAGE:-image/madagents.sif}"
+OVERLAY="${APPTAINER_OVERLAY:-image/mad_overlay.img}"
+[[ "${IMAGE}"   = /* ]] || IMAGE="${SCRIPT_DIR}/${IMAGE}"
+[[ "${OVERLAY}" = /* ]] || OVERLAY="${SCRIPT_DIR}/${OVERLAY}"
 
 if [[ ! -f "${IMAGE}" ]]; then
   echo "ERROR: Container image not found at ${IMAGE}." >&2

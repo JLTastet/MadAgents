@@ -194,8 +194,8 @@ if [[ ! -x "${APPTAINER_BIN}" ]]; then
   exit 1
 fi
 
-IMAGE="${PROJECT_DIR}/image/madagents.sif"
-OVERLAY="${PROJECT_DIR}/image/mad_overlay.img"
+IMAGE="$(resolve_path "${APPTAINER_IMAGE:-image/madagents.sif}")"
+OVERLAY="$(resolve_path "${APPTAINER_OVERLAY:-image/mad_overlay.img}")"
 
 MADRUN_LOG="${LOGDIR}/madrun.log"
 APPTAINER_LOG="${LOGDIR}/apptainer.log"

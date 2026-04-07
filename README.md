@@ -196,8 +196,12 @@ Use `config.env.example` as the template if `config.env` is missing.
 ### Global settings (both modes)
 
 - `APPTAINER_DIR` — directory containing the `apptainer` binary (required by `image/create_image.sh`).
+- `APPTAINER_IMAGE` — path to the Apptainer `.sif` image (`image/madagents.sif`). Useful when sharing a prebuilt image from a common location instead of the per-clone default.
+- `APPTAINER_OVERLAY` — path to the writable overlay image (`image/mad_overlay.img`).
 - `OUTPUT_DIR` — outputs folder (`output`)
 - `RUN_DIR` — runtime folder for logs, locks, sockets (`run_dir`)
+
+> Relative paths for `APPTAINER_IMAGE` / `APPTAINER_OVERLAY` resolve against the repo root; absolute paths are used as-is.
 
 ### API version
 
