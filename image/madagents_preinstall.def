@@ -22,7 +22,7 @@ From: node:22-bookworm
         nodejs npm cmake \
         swig autoconf libtool libboost-dev libgmp-dev libmpfr-dev \
         binutils dpkg-dev git libssl-dev \
-        libx11-dev libxext-dev libxft-dev libxpm-dev libgif-dev bc
+        libx11-dev libxext-dev libxft-dev libxpm-dev libgif-dev bc tmux
 
     # w3m fim
 

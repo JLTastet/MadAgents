@@ -394,6 +394,18 @@ else
   fi
 fi
 
+# ── Verify tmux inside the container (required by doc-editing agent teams) ──
+if [[ "${ENABLE_DOC_EDITING}" == "1" ]]; then
+  if ! "${APPTAINER_BIN}" exec "instance://${INSTANCE_NAME}" \
+       bash -c 'command -v tmux >/dev/null 2>&1'; then
+    echo "ERROR: ENABLE_DOC_EDITING=1 requires tmux inside the container, but it was not found." >&2
+    echo "       The current image was built without tmux. Rebuild with:" >&2
+    echo "         ./image/create_image.sh --type preinstall   # or --type clean" >&2
+    echo "       (the latest madagents_*.def installs tmux)." >&2
+    exit 1
+  fi
+fi
+
 # ── Run Claude Code inside the instance ──────────────────────────────
 # --fakeroot is inherited from the instance, so Claude Code sees UID 0.
 # Because of this, --dangerously-skip-permissions cannot be used.
