@@ -13,6 +13,7 @@ from madagents.config import (
     default_config,
     OPENAI_MODELS,
     ANTHROPIC_MODELS,
+    VLLM_MODELS,
 )
 from madagents.llm import LLMRuntime, get_runtime_for_provider
 
@@ -233,7 +234,12 @@ class MadAgents:
         if enable_model_routing:
             default_worker_model = script_cfg.model or worker_model
             provider = infer_provider_from_model(default_worker_model)
-            all_provider_models = ANTHROPIC_MODELS if provider == "anthropic" else OPENAI_MODELS
+            if provider == "vllm":
+                all_provider_models = VLLM_MODELS
+            elif provider == "anthropic":
+                all_provider_models = ANTHROPIC_MODELS
+            else:
+                all_provider_models = OPENAI_MODELS
             strongest = _strongest_model_for_provider(orchestrator_cfg.model, provider or "openai")
             available_worker_models = models_for_routing(all_provider_models, strongest)
 

@@ -13,18 +13,22 @@ SUPPORTED_MODELS: List[str] = [
     "claude-opus-4-6",
     "claude-sonnet-4-6",
     "claude-haiku-4-5",
+    "qwen3.5-4b",
+    "qwen3.5-27b",
 ]
 
-SUPPORTED_PROVIDERS: List[str] = ["openai", "anthropic"]
+SUPPORTED_PROVIDERS: List[str] = ["openai", "anthropic", "vllm"]
 
 VERBOSITY_LEVELS: List[str] = ["low", "medium", "high"]
 REASONING_EFFORT_LEVELS: List[str] = ["minimal", "low", "medium", "high"]
 
 OPENAI_MODEL_PREFIXES: tuple[str, ...] = ("gpt-",)
 ANTHROPIC_MODEL_PREFIXES: tuple[str, ...] = ("claude-",)
+VLLM_MODEL_PREFIXES: tuple[str, ...] = ("qwen",)
 
 OPENAI_MODELS: List[str] = [m for m in SUPPORTED_MODELS if m.startswith(OPENAI_MODEL_PREFIXES)]
 ANTHROPIC_MODELS: List[str] = [m for m in SUPPORTED_MODELS if m.startswith(ANTHROPIC_MODEL_PREFIXES)]
+VLLM_MODELS: List[str] = [m for m in SUPPORTED_MODELS if m.startswith(VLLM_MODEL_PREFIXES)]
 
 # Model capability tiers for orchestrator routing decisions.
 ANTHROPIC_MODEL_TIERS: Dict[str, tuple[str, str]] = {
@@ -39,6 +43,17 @@ OPENAI_MODEL_TIERS: Dict[str, tuple[str, str]] = {
     "gpt-5.1": ("strongest", "Complex reasoning, physics, domain expertise, code generation, failed retries"),
     "gpt-5-mini": ("mid-tier", "Read-only research, formatting, scratch-space work"),
     "gpt-5-nano": ("lightest", "Simple extraction, formatting, lookups, straightforward file ops"),
+}
+
+# Per-model-family tier dicts for vLLM-served models.
+# VLLM_MODEL_TIERS is the union, used by _ALL_MODEL_TIERS and routing.
+QWEN_MODEL_TIERS: Dict[str, tuple[str, str]] = {
+    "qwen3.5-27b": ("strongest", "Complex reasoning, physics, domain expertise, code generation"),
+    "qwen3.5-4b": ("lightest", "Simple extraction, formatting, lookups"),
+}
+
+VLLM_MODEL_TIERS: Dict[str, tuple[str, str]] = {
+    **QWEN_MODEL_TIERS,
 }
 
 # Worker-only agents that can be routed to by the orchestrator.
@@ -66,11 +81,14 @@ AGENT_ORDER: List[str] = [
 ]
 
 
-_ALL_MODEL_TIERS: Dict[str, tuple[str, str]] = {**ANTHROPIC_MODEL_TIERS, **OPENAI_MODEL_TIERS}
+_ALL_MODEL_TIERS: Dict[str, tuple[str, str]] = {
+    **ANTHROPIC_MODEL_TIERS, **OPENAI_MODEL_TIERS, **VLLM_MODEL_TIERS
+}
 
 
 DEFAULT_STRONGEST_OPENAI_MODEL: str = "gpt-5.2"
 DEFAULT_STRONGEST_ANTHROPIC_MODEL: str = "claude-opus-4-6"
+DEFAULT_STRONGEST_VLLM_MODEL: str = "qwen3.5-27b"
 
 
 def _strongest_model_for_provider(
@@ -87,6 +105,8 @@ def _strongest_model_for_provider(
         return orchestrator_model
     if provider == "anthropic":
         return DEFAULT_STRONGEST_ANTHROPIC_MODEL
+    if provider == "vllm":
+        return DEFAULT_STRONGEST_VLLM_MODEL
     return DEFAULT_STRONGEST_OPENAI_MODEL
 
 
@@ -122,6 +142,8 @@ def infer_provider_from_model(model: Optional[str]) -> Optional[str]:
         return "openai"
     if normalized.startswith(ANTHROPIC_MODEL_PREFIXES):
         return "anthropic"
+    if normalized.startswith(VLLM_MODEL_PREFIXES):
+        return "vllm"
     return None
 
 

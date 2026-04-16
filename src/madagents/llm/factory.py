@@ -3,6 +3,7 @@ from __future__ import annotations
 from madagents.llm.anthropic_runtime import AnthropicLLMRuntime
 from madagents.llm.openai_runtime import OpenAILLMRuntime
 from madagents.llm.runtime import LLMRuntime
+from madagents.llm.vllm_runtime import VLLMRuntime
 
 _DEFAULT_RUNTIME: LLMRuntime = OpenAILLMRuntime()
 
@@ -17,4 +18,6 @@ def get_runtime_for_provider(provider: str) -> LLMRuntime:
     normalized = (provider or "").strip().lower()
     if normalized == "anthropic":
         return AnthropicLLMRuntime()
+    if normalized == "vllm":
+        return VLLMRuntime()
     return OpenAILLMRuntime()
