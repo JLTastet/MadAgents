@@ -245,6 +245,9 @@ class MadAgentsConfig(BaseModel):
         return value
 
 
+DEFAULT_SUMMARIZER_TOKEN_THRESHOLD: int = 150_000
+
+
 def _default_agents() -> Dict[str, AgentConfig]:
     """Return the default AgentConfig set for all agents."""
     agents: Dict[str, AgentConfig] = {
@@ -260,7 +263,7 @@ def _default_agents() -> Dict[str, AgentConfig]:
             step_limit=None,
             supports_step_limit=False,
             reasoning_effort="low",
-            token_threshold=150_000,
+            token_threshold=DEFAULT_SUMMARIZER_TOKEN_THRESHOLD,
             keep_last_messages=10,
             min_tail_tokens=10_000,
         ),
@@ -275,6 +278,35 @@ def _default_agents() -> Dict[str, AgentConfig]:
 def default_config() -> MadAgentsConfig:
     """Build the default MadAgentsConfig."""
     return MadAgentsConfig(workflow_step_limit=1000, agents=_default_agents())
+
+
+def _apply_vllm_summarizer_defaults(data: dict) -> None:
+    """Always derive ``summarizer.token_threshold`` from the runtime for vLLM.
+
+    The system default (``DEFAULT_SUMMARIZER_TOKEN_THRESHOLD``, 150 K) was
+    chosen for API-provider context windows and is a poor default for vLLM,
+    which can serve anything from a 32 K-context single-GPU setup to a
+    256 K+ multi-GPU deployment.  Rather than pick a different fixed number,
+    we derive the threshold from the runtime's actual ``MAX_MODEL_LEN`` (via
+    ``vllm_tokens.summarizer_token_threshold``) so it scales with whatever
+    model vLLM was started with.
+
+    Tradeoff: this override is unconditional — if a caller explicitly writes
+    ``agents.summarizer.token_threshold`` in their config for a vLLM
+    deployment, it is silently replaced.  We accept that loss of caller
+    intent because (a) the 150 K API-provider default collides with any
+    value a user might reasonably type, making "explicit vs. inherited"
+    indistinguishable post-Pydantic-validation, and (b) no current caller
+    sets this field for vLLM.  Users who need a custom trigger should tune
+    ``MAX_MODEL_LEN`` or ``vllm_tokens.VLLM_SUMMARIZER_THRESHOLD_CEILING``
+    instead.
+    """
+    from madagents.llm.vllm_tokens import summarizer_token_threshold
+
+    summarizer = data.get("agents", {}).get("summarizer") or {}
+    if summarizer.get("provider") != "vllm":
+        return
+    summarizer["token_threshold"] = summarizer_token_threshold()
 
 
 def apply_global_overrides(
@@ -300,6 +332,7 @@ def apply_global_overrides(
         # Set verbosity uniformly across all agents.
         for agent in data.get("agents", {}).values():
             agent["verbosity"] = verbosity
+    _apply_vllm_summarizer_defaults(data)
     return MadAgentsConfig.model_validate(data)
 
 
