@@ -7,17 +7,12 @@ from typing import Any
 from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
+from madagents.config import REASONING_EFFORT_LEVELS
 from madagents.llm import vllm_patches  # noqa: F401  -- installs reasoning_content patch on import
+from madagents.llm import vllm_tokens
 from madagents.llm.runtime import LLMRuntime
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-_max_model_len = int(os.environ.get("MAX_MODEL_LEN", "65536"))
-VLLM_MAX_OUTPUT = _max_model_len // 2
 
 # ---------------------------------------------------------------------------
 # Model-family lookup tables
@@ -29,16 +24,25 @@ _SAMPLING_PRESETS: dict[str, dict[str, float]] = {
     "default": {"temperature": 0.7, "top_p": 0.9, "top_k": 0, "min_p": 0.0},
 }
 
-# Thinking control per model family (extra_body kwargs to enable/disable).
-# Both directions supported: some models think by default (larger Qwen3.5),
-# others don't (smaller variants may default to no-think).
-_THINKING_CONTROL: dict[str, dict | None] = {
+# Per-family mapping from MadAgents reasoning_effort to the ``extra_body``
+# kwargs that realize it on vLLM. Each family must cover every effort level
+# in REASONING_EFFORT_LEVELS — enforced by the assert below so a new level
+# added in MadAgents fails loud here until every family is updated.
+_THINKING_CONTROL: dict[str, dict[str, dict]] = {
     "qwen": {
-        "enable": {"chat_template_kwargs": {"enable_thinking": True}},
-        "disable": {"chat_template_kwargs": {"enable_thinking": False}},
+        "minimal": {"chat_template_kwargs": {"enable_thinking": False}},
+        "low":     {"chat_template_kwargs": {"enable_thinking": False}},
+        "medium":  {"chat_template_kwargs": {"enable_thinking": True}},
+        "high":    {"chat_template_kwargs": {"enable_thinking": True}},
     },
-    # "gpt-oss": None,  # No thinking support
+    # "gpt-oss": {...},  # when we add it
 }
+
+for _family, _mapping in _THINKING_CONTROL.items():
+    assert set(_mapping) == set(REASONING_EFFORT_LEVELS), (
+        f"_THINKING_CONTROL[{_family!r}] must map exactly "
+        f"{set(REASONING_EFFORT_LEVELS)}; got {set(_mapping)}"
+    )
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -70,13 +74,58 @@ def _get_sampling_defaults(model_name: str) -> dict[str, float]:
     return _SAMPLING_PRESETS["default"]
 
 
-def _get_thinking_control(model_name: str) -> dict | None:
-    """Look up thinking control dict by model-family prefix."""
+def _thinking_family(model_name: str) -> str | None:
+    """Return the ``_THINKING_CONTROL`` key matching ``model_name``'s prefix, or None."""
     lower = model_name.lower()
-    for prefix, control in _THINKING_CONTROL.items():
+    for prefix in _THINKING_CONTROL:
         if lower.startswith(prefix):
-            return control
+            return prefix
     return None
+
+
+def _get_existing_bound_max_tokens(llm: Any) -> int | None:
+    """Return any ``max_tokens`` already bound on ``llm`` via ``.bind()``.
+
+    LangChain's ``RunnableBinding.bind()`` flattens chained bind calls into
+    a single binding layer (``kwargs = {**old, **new}``), so checking the
+    top-level ``kwargs`` is sufficient. Returns ``None`` if no caller has
+    bound a value.
+    """
+    kwargs = getattr(llm, "kwargs", None)
+    if isinstance(kwargs, dict):
+        val = kwargs.get("max_tokens")
+        if isinstance(val, int) and val > 0:
+            return val
+    return None
+
+
+def _reject_unsupported_caller_max_tokens(max_tokens: Any) -> None:
+    """Fail loud on obvious misuses of ``create_chat_model``'s ``max_tokens``.
+
+    ``VLLMRuntime`` ignores the construction-time ``max_tokens`` entirely;
+    the real cap is computed per call in ``invoke()``. Behaviour by value:
+
+    * ``0 < max_tokens < VLLM_DEFAULT_MAX_OUTPUT`` → **raise**. A value this
+      small almost certainly means the caller *meant* it as a cap; silently
+      dropping it would be surprising.
+    * otherwise (including the ``1_000_000`` sentinel every current call
+      site passes) → silently ignored. Signal-to-noise is too low to reject
+      (test fixtures, docs, "no opinion" defaults all land here).
+
+    To actually cap output, wrap the returned llm with
+    ``llm.bind(max_tokens=N)``. ``invoke()`` honours caller binds in either
+    direction — tighter wins silently, looser wins with a WARNING and may
+    trigger a vLLM rejection if it overflows the context window.
+    """
+    if isinstance(max_tokens, int) and 0 < max_tokens < vllm_tokens.VLLM_DEFAULT_MAX_OUTPUT:
+        raise RuntimeError(
+            f"VLLMRuntime ignores caller-configured max_tokens ({max_tokens}); "
+            f"value is below the runtime default ceiling "
+            f"({vllm_tokens.VLLM_DEFAULT_MAX_OUTPUT}) and would silently be "
+            f"discarded. If you actually want a per-call cap, use "
+            f"``llm.bind(max_tokens=N)`` on the returned instance; ``invoke()`` "
+            f"honours it (tighter wins silently, looser wins with a WARNING)."
+        )
 
 
 def _get_model_name(llm: Any) -> str:
@@ -191,8 +240,7 @@ def _fix_trailing_assistant(messages: list[BaseMessage]) -> list[BaseMessage]:
     The obvious alternative — appending a synthetic user message like
     "Continue." — doesn't work either: Qwen reacts to it with
     meta-commentary ("The user is waiting for me to continue...") instead
-    of doing useful work.  This was tested exhaustively during the Anthropic
-    compat shim development; every trailing-message variation failed.
+    of doing useful work.  Every trailing-message variation we tried failed.
 
     Simply dropping the trailing assistant message is safe because its content
     is already captured in the orchestrator's ``orchestrator_messages`` stream
@@ -239,9 +287,12 @@ class VLLMRuntime(LLMRuntime):
     ) -> ChatOpenAI:
         vllm_model = _resolve_vllm_model()
         vllm_url = _resolve_vllm_url()
-        capped = min(max_tokens, VLLM_MAX_OUTPUT) if isinstance(max_tokens, int) else VLLM_MAX_OUTPUT
         sampling = _get_sampling_defaults(vllm_model)
 
+        _reject_unsupported_caller_max_tokens(max_tokens)
+
+        # No static max_tokens on ChatOpenAI: ``invoke()`` binds a dynamic
+        # value from the exact prompt size per call.
         return ChatOpenAI(
             model=vllm_model,
             base_url=vllm_url,
@@ -249,7 +300,6 @@ class VLLMRuntime(LLMRuntime):
             use_responses_api=False,
             temperature=sampling["temperature"],
             top_p=sampling["top_p"],
-            max_tokens=capped,
             extra_body={"top_k": sampling["top_k"], "min_p": sampling["min_p"]},
         )
 
@@ -267,20 +317,17 @@ class VLLMRuntime(LLMRuntime):
         return llm_tools, node_tools
 
     def bind_reasoning(
-        self, llm: Any, *, reasoning_effort: str, adaptive: bool = True
+        self,
+        llm: Any,
+        *,
+        reasoning_effort: str,
+        adaptive: bool = True,  # Unused; Anthropic-only adaptive-thinking hint.
     ) -> Any:
-        effort = (reasoning_effort or "").strip().lower()
-        model_name = _get_model_name(llm)
-        control = _get_thinking_control(model_name)
-
-        if control is None:
-            return llm  # Model doesn't support thinking control
-
-        if effort in ("minimal", "low"):
-            return llm.bind(extra_body=control["disable"])
-        # Explicitly enable thinking for high/medium effort.
-        # This handles models where thinking is off by default.
-        return llm.bind(extra_body=control["enable"])
+        effort = (reasoning_effort or "").strip().lower() or None
+        family = _thinking_family(_get_model_name(llm))
+        if not effort or family is None:
+            return llm  # No applicable thinking control — use model default.
+        return llm.bind(extra_body=_THINKING_CONTROL[family][effort])
 
     def bind_reasoning_trace(self, llm: Any) -> Any:
         return llm  # No-op — encrypted reasoning traces are OpenAI-specific
@@ -291,10 +338,30 @@ class VLLMRuntime(LLMRuntime):
         messages: list[BaseMessage],
         *,
         reasoning_effort: str | None = None,
+        agent_name: str | None = None,
     ) -> Any:
         messages = _consolidate_system_messages(list(messages))
         messages = _fix_trailing_assistant(messages)
-        return llm.invoke(messages)
+        dynamic_max = vllm_tokens.prepare_invocation(
+            llm, messages, agent_name=agent_name,
+        )
+        # Caller's ``.bind(max_tokens=N)`` takes precedence, in either
+        # direction.  Tighter is safe and silent.  Looser is honoured with a
+        # WARNING: it may exceed the remaining context budget, in which case
+        # vLLM will reject the request.
+        caller_max = _get_existing_bound_max_tokens(llm)
+        if caller_max is not None and caller_max != dynamic_max:
+            if caller_max > dynamic_max:
+                logger.warning(
+                    "vllm_runtime: caller-bound max_tokens=%d exceeds the "
+                    "dynamic cap %d for agent=%s. Honouring it; vLLM will "
+                    "reject the request if prompt_tokens + max_tokens > "
+                    "MAX_MODEL_LEN.",
+                    caller_max, dynamic_max, agent_name,
+                )
+            dynamic_max = caller_max
+        bound = llm.bind(max_tokens=dynamic_max)
+        return bound.invoke(messages)
 
     def with_structured_output(
         self,
@@ -306,7 +373,29 @@ class VLLMRuntime(LLMRuntime):
         tools: list | None = None,
         include_reasoning_trace: bool = False,
         reasoning_effort: str | None = None,
+        agent_name: str | None = None,  # Reserved for future per-agent policy in structured-output path.
     ) -> Any:
+        # vLLM's structured-output path doesn't yet support tool-calling or
+        # reasoning-trace passthrough the way OpenAI/Anthropic runtimes do.
+        # Fail loud rather than silently drop the kwargs.
+        if tools is not None:
+            raise NotImplementedError(
+                "VLLMRuntime.with_structured_output does not support `tools`. "
+                "Tool-calling structured output would mirror OpenAI's "
+                "_structured_output_with_tools path; not implemented yet."
+            )
+        if include_reasoning_trace:
+            raise NotImplementedError(
+                "VLLMRuntime.with_structured_output does not support "
+                "`include_reasoning_trace`. Reasoning content is captured via "
+                "the vllm_patches monkey-patch on regular invoke() calls."
+            )
+        if isinstance(reasoning_effort, str) and reasoning_effort:
+            raise NotImplementedError(
+                "VLLMRuntime.with_structured_output does not forward "
+                "`reasoning_effort`. Call bind_reasoning on the llm before "
+                "passing it in."
+            )
         kwargs: dict[str, Any] = {"include_raw": include_raw}
         if strict is not None:
             kwargs["strict"] = strict
