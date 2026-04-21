@@ -40,8 +40,14 @@ class LLMRuntime(Protocol):
         messages: list[BaseMessage],
         *,
         reasoning_effort: str | None = None,
+        agent_name: str | None = None,
     ) -> Any:
-        """Invoke a model with provider-specific call arguments."""
+        """Invoke a model with provider-specific call arguments.
+
+        ``agent_name`` is an advisory hint identifying the caller — runtimes
+        may use it to apply per-agent policies (e.g. sampling overrides,
+        output-budget ceilings). Runtimes that don't need it ignore it.
+        """
 
     def with_structured_output(
         self,
@@ -53,5 +59,6 @@ class LLMRuntime(Protocol):
         tools: list | None = None,
         include_reasoning_trace: bool = False,
         reasoning_effort: str | None = None,
+        agent_name: str | None = None,
     ) -> Any:
         """Create a structured-output bound model with provider-specific args."""

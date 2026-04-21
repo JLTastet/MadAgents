@@ -69,6 +69,7 @@ class OpenAILLMRuntime(LLMRuntime):
         messages: list[BaseMessage],
         *,
         reasoning_effort: str | None = None,
+        agent_name: str | None = None,  # Unused; vLLM-only routing hint.
     ) -> Any:
         if isinstance(reasoning_effort, str) and reasoning_effort:
             return llm.invoke(messages, reasoning={"effort": reasoning_effort})
@@ -84,6 +85,7 @@ class OpenAILLMRuntime(LLMRuntime):
         tools: list | None = None,
         include_reasoning_trace: bool = False,
         reasoning_effort: str | None = None,
+        agent_name: str | None = None,  # Unused; vLLM-only routing hint.
     ) -> Any:
         if tools is not None:
             return self._structured_output_with_tools(

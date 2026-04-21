@@ -113,7 +113,11 @@ def get_worker_node(
             ),
             *context_msgs,
         ]
-        response = runtime.invoke(_llm, messages, reasoning_effort=reasoning_effort)
+        response = runtime.invoke(
+            _llm, messages,
+            reasoning_effort=reasoning_effort,
+            agent_name=name,
+        )
         response.name = name
         # Persist token counts for downstream accounting.
         annotate_output_token_counts(response, include_reasoning=True, include_total=True)

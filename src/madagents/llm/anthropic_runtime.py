@@ -370,6 +370,7 @@ class AnthropicLLMRuntime(LLMRuntime):
         messages: list[BaseMessage],
         *,
         reasoning_effort: str | None = None,
+        agent_name: str | None = None,  # Unused; vLLM-only routing hint.
     ) -> Any:
         messages = self._add_conversation_cache_breakpoint(messages)
         return llm.invoke(messages)
@@ -384,6 +385,7 @@ class AnthropicLLMRuntime(LLMRuntime):
         tools: list | None = None,
         include_reasoning_trace: bool = False,
         reasoning_effort: str | None = None,
+        agent_name: str | None = None,  # Unused; vLLM-only routing hint.
     ) -> Any:
         # Check if thinking is active (via .bind() kwargs or constructor).
         has_thinking = (

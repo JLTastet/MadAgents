@@ -758,7 +758,9 @@ def get_orchestrator_node(
             *context_msgs,
         ]
 
-        response: AIMessage = runtime.invoke(llm_with_tools, messages)
+        response: AIMessage = runtime.invoke(
+            llm_with_tools, messages, agent_name="orchestrator",
+        )
         response.name = "orchestrator"
 
         # 6a. Extract thinking content (Anthropic extended thinking)

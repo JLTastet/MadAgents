@@ -528,7 +528,9 @@ def get_planner_node(
         ]
 
         response = runtime.invoke(
-            llm_with_tools, messages, reasoning_effort=reasoning_effort,
+            llm_with_tools, messages,
+            reasoning_effort=reasoning_effort,
+            agent_name="planner",
         )
 
         response.name = "planner"

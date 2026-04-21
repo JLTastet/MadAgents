@@ -94,7 +94,9 @@ class Summarizer:
             HumanMessage(content="Summarize the following conversation transcript:\n\n" + transcript),
         ]
 
-        summary = self.runtime.invoke(self.llm, invoke_messages)
+        summary = self.runtime.invoke(
+            self.llm, invoke_messages, agent_name="summarizer",
+        )
         text = response_to_text(summary)
         return _extract_summary_tags(text)
     
