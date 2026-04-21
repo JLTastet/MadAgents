@@ -7,6 +7,7 @@ from typing import Any
 from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
+from madagents.llm import vllm_patches  # noqa: F401  -- installs reasoning_content patch on import
 from madagents.llm.runtime import LLMRuntime
 
 logger = logging.getLogger(__name__)
