@@ -594,10 +594,23 @@ def build_worker_context(plan: dict | None, message: str, step_id: int | None = 
     return "\n".join(parts) + "\n\n" + message
 
 
+def _coerce_optional_int(args: dict, field: str) -> None:
+    """Coerce ``args[field]`` from str to int when possible; no-op otherwise.
+    Tolerates tool-call schema violations from non-strict models."""
+    value = args.get(field)
+    if isinstance(value, str):
+        try:
+            args[field] = int(value)
+        except ValueError:
+            pass
+
+
 def _parse_tool_call_to_decision(tool_call: dict) -> dict:
     """Convert a LangChain tool_call dict to an orchestrator dispatch dict."""
     name = tool_call.get("name", "")
     args = tool_call.get("args", {})
+    _coerce_optional_int(args, "instance_id")
+    _coerce_optional_int(args, "step_id")
 
     if name == "InvokePlanner":
         dispatch = {
