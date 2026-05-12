@@ -352,17 +352,30 @@ def prepare_invocation(
     messages: list[BaseMessage],
     *,
     agent_name: str | None,
-) -> int:
-    """Run all pre-call accounting and return the dynamic ``max_tokens`` to bind.
+) -> dict[str, Any]:
+    """Run all pre-call accounting for a vLLM invocation.
 
     Walks ``llm`` for any bound tools and ``chat_template_kwargs``, posts to
     ``/tokenize`` to get the exact prompt size, then resolves the per-agent
-    output ceiling against the remaining context. Caller is expected to do
-    ``llm.bind(max_tokens=<return value>).invoke(messages)``.
+    output ceiling against the remaining context.
+
+    Returns a dict with:
+      * ``dynamic_max_tokens`` (int): per-call output ceiling for this prompt.
+      * ``prompt_tokens_vllm`` (int): the exact prompt-token count vLLM reported.
+      * ``tools`` (list[dict] | None): tool schemas as bound on ``llm``.
+      * ``chat_template_kwargs`` (dict): chat-template kwargs as bound on ``llm``.
+
+    All four values reflect what was actually sent to ``/tokenize``.
     """
     tools = _extract_bound_tools(llm)
     chat_template_kwargs = _extract_chat_template_kwargs(llm)
     prompt_tokens = count_prompt_tokens(
         messages, tools=tools, chat_template_kwargs=chat_template_kwargs,
     )
-    return compute_dynamic_max_tokens(prompt_tokens, agent_name=agent_name)
+    dynamic_max = compute_dynamic_max_tokens(prompt_tokens, agent_name=agent_name)
+    return {
+        "dynamic_max_tokens": dynamic_max,
+        "prompt_tokens_vllm": prompt_tokens,
+        "tools": tools,
+        "chat_template_kwargs": chat_template_kwargs,
+    }

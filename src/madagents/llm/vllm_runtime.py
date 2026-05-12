@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from madagents.config import REASONING_EFFORT_LEVELS
-from madagents.llm import vllm_patches  # noqa: F401  -- installs reasoning_content patch on import
+from madagents.llm import trace_recorder, vllm_patches  # noqa: F401  -- vllm_patches installs reasoning_content patch on import
 from madagents.llm import vllm_tokens
 from madagents.llm.runtime import LLMRuntime
 
@@ -81,6 +82,63 @@ def _thinking_family(model_name: str) -> str | None:
         if lower.startswith(prefix):
             return prefix
     return None
+
+
+def _extract_sampling_params(llm: Any) -> dict[str, Any]:
+    """Return sampling params reflecting what's actually bound for the call.
+
+    Reads native ChatOpenAI Pydantic fields (``temperature``, ``top_p``,
+    ``seed``) which serialise at OpenAI request top-level, and the outermost
+    ``RunnableBinding.kwargs.extra_body`` (``top_k``, ``min_p``) which is
+    what's on the wire after any ``.bind(extra_body=...)`` override. Returns
+    only the keys that are present and non-None — callers should treat
+    absence as "not bound at this level".
+    """
+    # FIXME: on reasoning-enabled calls, ``top_k`` and ``min_p`` are absent
+    # from the returned dict because ``bind_reasoning`` wholly replaces the
+    # constructor's ``extra_body`` with one that only carries
+    # ``chat_template_kwargs`` (RunnableBinding does flat top-level kwarg
+    # replacement, not deep-merge). The values returned here are wire-
+    # faithful — they reflect what the audit script will see — but the wire
+    # itself is wrong: dropping ``top_k=20`` materially affects sampling
+    # diversity on Qwen3.5 reasoning turns. The right fix is to make
+    # ``bind_reasoning`` deep-merge ``extra_body`` so ``top_k``/``min_p``
+    # survive; once that lands, this helper can read the outer binding's
+    # extra_body literally without the chain-walk fallback below.
+    base = llm
+    while hasattr(base, "bound") and base.bound is not None:
+        base = base.bound
+
+    out: dict[str, Any] = {}
+    for native in ("temperature", "top_p", "seed"):
+        v = getattr(base, native, None)
+        if v is not None:
+            out[native] = v
+
+    # Find the FIRST (outermost) RunnableBinding layer whose kwargs carry an
+    # extra_body, walking down toward base. RunnableBinding.bind() flattens
+    # chained .bind() calls into the outer layer's kwargs (later .bind() wins
+    # via {**self.kwargs, **kw} merge), so for any chain produced by .bind()
+    # this loop hits on the first iteration. Walking handles the manually-
+    # nested case (RunnableBinding(bound=RunnableBinding(bound=chat))) where
+    # the inner layer might carry the extra_body the outer didn't override.
+    extra_body: dict[str, Any] | None = None
+    cur = llm
+    while cur is not None and cur is not base:
+        kw = getattr(cur, "kwargs", None)
+        if isinstance(kw, dict) and isinstance(kw.get("extra_body"), dict):
+            extra_body = kw["extra_body"]
+            break
+        cur = getattr(cur, "bound", None)
+    if extra_body is None:
+        candidate = getattr(base, "extra_body", None)
+        if isinstance(candidate, dict):
+            extra_body = candidate
+    if extra_body:
+        for key in ("top_k", "min_p"):
+            if extra_body.get(key) is not None:
+                out[key] = extra_body[key]
+    return out
 
 
 def _get_existing_bound_max_tokens(llm: Any) -> int | None:
@@ -291,9 +349,23 @@ class VLLMRuntime(LLMRuntime):
 
         _reject_unsupported_caller_max_tokens(max_tokens)
 
-        # No static max_tokens on ChatOpenAI: ``invoke()`` binds a dynamic
-        # value from the exact prompt size per call.
-        return ChatOpenAI(
+        # Seed reproducibility for per-trial replay. Read MADAGENTS_VLLM_SEED
+        # from env and pass via the native ChatOpenAI Pydantic ``seed`` field —
+        # NOT via ``extra_body``. ``bind_reasoning`` calls
+        # ``llm.bind(extra_body={"chat_template_kwargs": ...})``, and
+        # RunnableBinding does flat top-level kwarg replacement (not deep
+        # merge), so anything we put in extra_body here would be silently
+        # dropped on every reasoning-enabled call. The native ``seed`` field
+        # lives on the inner Pydantic instance and survives all .bind() calls.
+        seed: int | None = None
+        seed_env = os.environ.get("MADAGENTS_VLLM_SEED")
+        if seed_env:
+            try:
+                seed = int(seed_env)
+            except ValueError:
+                logger.warning("MADAGENTS_VLLM_SEED=%r is not an int; ignoring", seed_env)
+
+        kwargs: dict[str, Any] = dict(
             model=vllm_model,
             base_url=vllm_url,
             api_key=os.environ.get("VLLM_API_KEY", "dummy"),
@@ -302,6 +374,11 @@ class VLLMRuntime(LLMRuntime):
             top_p=sampling["top_p"],
             extra_body={"top_k": sampling["top_k"], "min_p": sampling["min_p"]},
         )
+        if seed is not None:
+            kwargs["seed"] = seed
+        # No static max_tokens on ChatOpenAI: ``invoke()`` binds a dynamic
+        # value from the exact prompt size per call.
+        return ChatOpenAI(**kwargs)
 
     def build_preamble(self, *, prompt: str) -> list[BaseMessage]:
         return [SystemMessage(content=prompt)]
@@ -337,14 +414,20 @@ class VLLMRuntime(LLMRuntime):
         llm: Any,
         messages: list[BaseMessage],
         *,
+        # Unused here — base-class API parity with ``LLMRuntime.invoke``;
+        # ``OpenAIRuntime`` etc. consume this kwarg. The vLLM path expresses
+        # reasoning effort through ``bind_reasoning`` (which sets
+        # ``chat_template_kwargs.enable_thinking``); the recorder reads the
+        # wire-faithful indicator from there.
         reasoning_effort: str | None = None,
         agent_name: str | None = None,
     ) -> Any:
         messages = _consolidate_system_messages(list(messages))
         messages = _fix_trailing_assistant(messages)
-        dynamic_max = vllm_tokens.prepare_invocation(
+        plan = vllm_tokens.prepare_invocation(
             llm, messages, agent_name=agent_name,
         )
+        dynamic_max = plan["dynamic_max_tokens"]
         # Caller's ``.bind(max_tokens=N)`` takes precedence, in either
         # direction.  Tighter is safe and silent.  Looser is honoured with a
         # WARNING: it may exceed the remaining context budget, in which case
@@ -361,7 +444,55 @@ class VLLMRuntime(LLMRuntime):
                 )
             dynamic_max = caller_max
         bound = llm.bind(max_tokens=dynamic_max)
-        return bound.invoke(messages)
+
+        t0 = time.monotonic()
+        result = bound.invoke(messages)
+        duration_ms = int((time.monotonic() - t0) * 1000)
+
+        # Runtime-invariant sanity check: the response's reported input_tokens
+        # must equal the prompt_tokens vLLM gave us via /tokenize. A mismatch
+        # means /tokenize and /chat/completions diverged, which would silently
+        # break training/inference parity. Log + latch on the record; never
+        # raise (the call already succeeded).
+        latched_error: str | None = None
+        usage = getattr(result, "usage_metadata", None) or {}
+        response_input_tokens = (
+            usage.get("input_tokens") if isinstance(usage, dict) else None
+        )
+        if (
+            response_input_tokens is not None
+            and response_input_tokens != plan["prompt_tokens_vllm"]
+        ):
+            latched_error = (
+                f"prompt_tokens_vllm={plan['prompt_tokens_vllm']} != "
+                f"usage_metadata.input_tokens={response_input_tokens}"
+            )
+            logger.warning(
+                "trace_recorder: token-count mismatch trial_id=%s agent=%s "
+                "prompt_tokens_vllm=%s input_tokens=%s",
+                os.environ.get("MADAGENTS_TRIAL_ID"), agent_name,
+                plan["prompt_tokens_vllm"], response_input_tokens,
+            )
+
+        # _MADAGENTS_ENABLE_TRACE is set by the benchmark runner; users opt
+        # in via the --capture-traces CLI flag.
+        if os.environ.get("_MADAGENTS_ENABLE_TRACE"):
+            sampling_params = _extract_sampling_params(llm)
+            trace_recorder.get_recorder().record(
+                agent_name=agent_name,
+                input_messages=messages,
+                tools=plan["tools"],
+                chat_template_kwargs=plan["chat_template_kwargs"],
+                prompt_tokens_vllm=plan["prompt_tokens_vllm"],
+                output_message=result,
+                usage_metadata=usage if isinstance(usage, dict) else None,
+                response_metadata=getattr(result, "response_metadata", None),
+                sampling_params=sampling_params,
+                dynamic_max_tokens=dynamic_max,
+                duration_ms=duration_ms,
+                latched_error=latched_error,
+            )
+        return result
 
     def with_structured_output(
         self,

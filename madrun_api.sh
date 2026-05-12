@@ -116,6 +116,19 @@ export APPTAINER_CONFIGDIR
 export NPM_CONFIG_CACHE
 export APPTAINERENV_NPM_CONFIG_CACHE="${NPM_CONFIG_CACHE}"
 
+# Forward reproducibility + trace-capture env vars into the Apptainer
+# container. The benchmark runner sets MADAGENTS_TRIAL_ID,
+# MADAGENTS_VLLM_SEED, and MADAGENTS_TOKENIZER_REVISION per trial.
+# _MADAGENTS_ENABLE_TRACE (internal, set by the runner only when
+# --capture-traces was passed) is read in-container to gate the heavy
+# traces.jsonl writes.
+# NOTE: any future APPTAINERENV_* line MUST use `${VAR:-}` because of
+# `set -u` at line 2.
+export APPTAINERENV_MADAGENTS_VLLM_SEED="${MADAGENTS_VLLM_SEED:-}"
+export APPTAINERENV_MADAGENTS_TRIAL_ID="${MADAGENTS_TRIAL_ID:-}"
+export APPTAINERENV_MADAGENTS_TOKENIZER_REVISION="${MADAGENTS_TOKENIZER_REVISION:-}"
+export APPTAINERENV__MADAGENTS_ENABLE_TRACE="${_MADAGENTS_ENABLE_TRACE:-}"
+
 # ---------- lock (prevent simultaneous runs in same clone) ----------
 LOCK_FILE="${RUN_DIR}/.madrun.lock"
 exec {LOCK_FD}>"${LOCK_FILE}" || { echo "ERROR: cannot open lock file ${LOCK_FILE}" >&2; exit 1; }
