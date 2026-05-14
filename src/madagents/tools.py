@@ -42,6 +42,8 @@ anthropic_web_search_tool = {"type": "web_search_20250305", "name": "web_search"
 ## bash #################################################################
 #########################################################################
 
+SPILL_INLINE_CHAR_LIMIT = 20_000
+
 def bash(commands: str) -> Tuple[str, dict]:
     """Run a bash command string and capture stdout/stderr with tailing."""
     timeout_s = 600
@@ -155,12 +157,18 @@ def bash(commands: str) -> Tuple[str, dict]:
         tail, n, truncated = get_last_lines_info(out_sink, n_lines=20)
         if truncated:
             artefact["stdout_last_n"] = n # we set this only if truncated
+        char_truncated = tail is not None and len(tail) > SPILL_INLINE_CHAR_LIMIT
+        if char_truncated:
+            tail = tail[:SPILL_INLINE_CHAR_LIMIT]
+            truncated = True
         stdout_text = tail or ""
         out_lines.append(f"stdout was large; full stdout is in: {out_sink.path}")
         if tail:
             truncated_str = f" (last {f'{n} lines' if n > 1 else 'line'})" if truncated else ""
             out_lines.append(f"--- stdout{truncated_str} ---")
             out_lines.append(tail)
+            if char_truncated:
+                out_lines.append(f"[… truncated — full output at {out_sink.path}]")
     else:
         stdout = out_sink.get_buffered().decode("utf-8", errors="replace")
         stdout_text = stdout
@@ -174,12 +182,18 @@ def bash(commands: str) -> Tuple[str, dict]:
         tail, n, truncated = get_last_lines_info(err_sink, n_lines=20)
         if truncated:
             artefact["stderr_last_n"] = n # we set this only if truncated
+        char_truncated = tail is not None and len(tail) > SPILL_INLINE_CHAR_LIMIT
+        if char_truncated:
+            tail = tail[:SPILL_INLINE_CHAR_LIMIT]
+            truncated = True
         stderr_text = tail or ""
         out_lines.append(f"stderr was large; full stderr is in: {err_sink.path}")
         if tail:
             truncated_str = f" (last {f'{n} lines' if n > 1 else 'line'})" if truncated else ""
             out_lines.append(f"--- stderr{truncated_str} ---")
             out_lines.append(tail)
+            if char_truncated:
+                out_lines.append(f"[… truncated — full output at {err_sink.path}]")
     else:
         stderr = err_sink.get_buffered().decode("utf-8", errors="replace")
         stderr_text = stderr
