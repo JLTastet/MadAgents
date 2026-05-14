@@ -30,7 +30,7 @@ from langchain_openai.chat_models.base import _convert_message_to_dict
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
-DEFAULT_LOG_PATH = "/output/traces.jsonl"
+DEFAULT_LOG_PATH = "/diagnostics/traces.jsonl"
 DROP_STUB_NAME = "trace_recorder_dropped.json"
 
 # agent_name -> agent_role. Must cover every entry in

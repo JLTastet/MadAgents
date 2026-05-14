@@ -376,6 +376,11 @@ def create_app(
             set_sys_link(log_dir, "/logs")
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
+        diagnostics_dir = os.path.join(workdir, "diagnostics")
+        try:
+            set_sys_link(diagnostics_dir, "/diagnostics")
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
 
         madgraph_bridge_dir = os.path.join(workdir, "madgraph_bridge")
         app.state.madgraph_handle = None  # no longer eagerly started
