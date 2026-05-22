@@ -96,8 +96,17 @@ RUN_DIR="${run_dir}"
 LOGDIR="${RUN_DIR}/logs"
 INSTANCE_NAME_FILE="${LOGDIR}/instance_name.txt"
 
+# madrun_code.sh writes the per-run instance name under
+# ${RUN_DIR}/workdirs/<stamp>/logs/instance_name.txt; pick the newest one if
+# the top-level INSTANCE_NAME_FILE (used by madrun_api.sh) is absent.
 if [[ -z "${instance_name}" && -f "${INSTANCE_NAME_FILE}" ]]; then
   instance_name="$(head -n 1 "${INSTANCE_NAME_FILE}" | tr -d '\r\n')"
+fi
+if [[ -z "${instance_name}" && -d "${RUN_DIR}/workdirs" ]]; then
+  latest_workdir_file="$(ls -1t "${RUN_DIR}"/workdirs/*/logs/instance_name.txt 2>/dev/null | head -n 1 || true)"
+  if [[ -n "${latest_workdir_file}" ]]; then
+    instance_name="$(head -n 1 "${latest_workdir_file}" | tr -d '\r\n')"
+  fi
 fi
 
 APPTAINER_BIN=""
@@ -151,7 +160,7 @@ if [[ -z "${instance_name}" ]]; then
 fi
 
 if instance_exists "${instance_name}"; then
-  "${APPTAINER_BIN}" instance stop "${instance_name}"
+  "${APPTAINER_BIN}" instance stop -F "${instance_name}"
   echo "madrun is closed now."
 fi
 

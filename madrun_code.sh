@@ -80,9 +80,25 @@ mkdir -p "${RUN_DIR}"
 LOCK_FILE="${RUN_DIR}/.madrun.lock"
 exec {LOCK_FD}>"${LOCK_FILE}" || { echo "ERROR: cannot open lock file ${LOCK_FILE}" >&2; exit 1; }
 if ! flock -n "${LOCK_FD}"; then
-  echo "ERROR: madrun is already running (lock: ${LOCK_FILE})" >&2
-  exit 1
+  # Lock might be stale: previous run's apptainer daemon inherited the FD and
+  # is still holding it even though the script process is gone. Detect that
+  # case by checking the recorded PID; if it's dead, kill any process still
+  # holding the file (the orphan daemon) and retry once.
+  prev_pid="$(head -n1 "${LOCK_FILE}" 2>/dev/null | tr -d '[:space:]')"
+  if [[ -n "${prev_pid}" ]] && kill -0 "${prev_pid}" 2>/dev/null; then
+    echo "ERROR: madrun is already running (PID ${prev_pid}, lock: ${LOCK_FILE})" >&2
+    exit 1
+  fi
+  echo "WARNING: stale madrun lock detected — killing leftover holders ..." >&2
+  fuser -k "${LOCK_FILE}" 2>/dev/null || true
+  sleep 1
+  if ! flock -n "${LOCK_FD}"; then
+    echo "ERROR: could not acquire madrun lock after cleanup (lock: ${LOCK_FILE})" >&2
+    exit 1
+  fi
 fi
+# Truncate any stale PID from a previous run before recording our own.
+: >"${LOCK_FILE}"
 printf '%s\n' "$$" 1>&"${LOCK_FD}"
 
 # ── Create workdir (v1.1 layout) ────────────────────────────────────
@@ -219,9 +235,9 @@ fi
 # ── Clean up stale processes holding the overlay ─────────────────────
 if fuser "${OVERLAY}" >/dev/null 2>&1; then
   echo "WARNING: overlay is locked by another process — cleaning up stale processes ..."
-  # Try graceful instance stop first
+  # Try graceful instance stop first (force-kill so stop never blocks waiting for SIGTERM).
   for name in $("${APPTAINER_BIN}" instance list 2>/dev/null | awk 'NR>1 {print $1}' | grep '^madagents-cc' || true); do
-    "${APPTAINER_BIN}" instance stop "${name}" 2>/dev/null || true
+    "${APPTAINER_BIN}" instance stop -F "${name}" 2>/dev/null || true
   done
   sleep 1
 
@@ -238,12 +254,28 @@ if fuser "${OVERLAY}" >/dev/null 2>&1; then
   echo "Stale processes cleaned up."
 fi
 
+# Remove any orphan instance state files left by a SIGKILLed run. Without this,
+# `instance start` would pick a non-default name (madagents-cc-1, -2, ...) to
+# dodge the stale entry, and the stop trap on the next run wouldn't find it.
+ORPHAN_STATE_DIR="${APPTAINER_CONFIGDIR:-${HOME}/.apptainer}/instances/app/$(hostname -s)/$(id -un)"
+if [[ -d "${ORPHAN_STATE_DIR}" ]]; then
+  for inst_dir in "${ORPHAN_STATE_DIR}"/madagents-cc*; do
+    [[ -d "${inst_dir}" ]] || continue
+    inst_pid_file="${inst_dir}/$(basename "${inst_dir}").json"
+    [[ -f "${inst_pid_file}" ]] || continue
+    inst_pid="$(python3 -c "import json,sys;print(json.load(open('${inst_pid_file}')).get('pid',''))" 2>/dev/null)"
+    if [[ -z "${inst_pid}" ]] || ! kill -0 "${inst_pid}" 2>/dev/null; then
+      rm -rf "${inst_dir}"
+    fi
+  done
+fi
+
 # ── Clean up overlay conflicts from v1.1 ──────────────────────────────
 # v1.1 uses /workspace as a symlink; Claude Code needs it as a directory
 # for bind mounts.  Remove stale symlinks so the overlay prep can create
-# proper directories.
+# proper directories. No --fakeroot: the overlay is created in no-fakeroot
+# mode (see image/create_image.sh) so the user owns the upper dir.
 "${APPTAINER_BIN}" exec \
-  --fakeroot \
   --overlay "${OVERLAY}" \
   "${IMAGE}" \
   bash -c '
@@ -256,7 +288,6 @@ fi
 OVERLAY_DIRS="/workspace /output /madgraph_docs /opt/claude /opt/.config/.claude"
 
 "${APPTAINER_BIN}" exec \
-  --fakeroot \
   --overlay "${OVERLAY}" \
   "${IMAGE}" \
   bash -c "for d in ${OVERLAY_DIRS}; do
@@ -292,13 +323,22 @@ cleanup() {
   fi
 
   if [[ "${SESSION_STARTED}" == "true" && -n "${INSTANCE_NAME}" ]]; then
-    "${APPTAINER_BIN}" instance stop "${INSTANCE_NAME}" 2>/dev/null || true
+    "${APPTAINER_BIN}" instance stop -F "${INSTANCE_NAME}" 2>/dev/null || true
+    # Verify; if stop was ignored (e.g. signal swallowed by fakeroot wrapper),
+    # SIGKILL the daemon PID directly from the state file.
+    inst_state="${APPTAINER_CONFIGDIR:-${HOME}/.apptainer}/instances/app/$(hostname -s)/$(id -un)/${INSTANCE_NAME}/${INSTANCE_NAME}.json"
+    if [[ -f "${inst_state}" ]]; then
+      inst_pid="$(python3 -c "import json; d=json.load(open('${inst_state}')); print(d.get('ppid') or d.get('pid') or '')" 2>/dev/null)"
+      if [[ -n "${inst_pid}" ]] && kill -0 "${inst_pid}" 2>/dev/null; then
+        kill -KILL "${inst_pid}" 2>/dev/null || true
+      fi
+      rm -rf "$(dirname "${inst_state}")"
+    fi
   fi
 
   # Remove Claude Code-specific directories from the overlay so they
   # don't conflict with v1.1's workspace management.
   timeout 10 "${APPTAINER_BIN}" exec \
-    --fakeroot \
     --overlay "${OVERLAY}" \
     "${IMAGE}" \
     bash -c '
@@ -329,22 +369,35 @@ for i in $(seq 0 99); do
     candidate="${INSTANCE_BASE}-${i}"
   fi
 
-  if "${APPTAINER_BIN}" instance start \
-    --fakeroot \
-    --cleanenv \
-    --env "CLAUDE_CONFIG_DIR=/opt/.config/.claude" \
-    --env "TERM=${TERM:-xterm-256color}" \
-    --env "LANG=${LANG:-C.UTF-8}" \
-    -B "${CLAUDE_CONFIG_DIR}:/opt/.config/.claude" \
-    -B "${OUTPUT_DIR}:/output" \
-    -B "${STAGING_CLAUDE}:/output/.claude" \
-    -B "${WORKDIR}/workspace:/workspace" \
-    -B "${MADGRAPH_DOCS}:/madgraph_docs:ro" \
-    ${CLAUDE_BIND_ARGS[@]+"${CLAUDE_BIND_ARGS[@]}"} \
-    --overlay "${OVERLAY}" \
-    "${IMAGE}" \
-    "${candidate}" \
-    >"${APPTAINER_LOG}" 2>&1; then
+  # Run in a subshell that closes LOCK_FD; otherwise the daemonized apptainer
+  # instance inherits the lock FD and holds .madrun.lock forever, blocking
+  # every subsequent run until the daemon is killed manually.
+  #
+  # Intentionally no --fakeroot: the LD_PRELOAD/libfakeroot path used in the
+  # absence of /etc/subuid entries deadlocks claude 2.1.x at startup. With
+  # a no-fakeroot overlay (see image/create_image.sh) the user can still
+  # write to /opt, /usr/local, etc. inside the container and have those
+  # writes persist in the overlay. The user is uid 1253 inside, which is
+  # fine for pip/npm/file installs; the rare ops that strictly require
+  # uid 0 (apt) should be done in a separate "apptainer exec --fakeroot
+  # --overlay" maintenance shell outside madrun_code.sh.
+  if (
+    eval "exec ${LOCK_FD}>&-"
+    "${APPTAINER_BIN}" instance start \
+      --cleanenv \
+      --env "CLAUDE_CONFIG_DIR=/opt/.config/.claude" \
+      --env "TERM=${TERM:-xterm-256color}" \
+      --env "LANG=${LANG:-C.UTF-8}" \
+      -B "${CLAUDE_CONFIG_DIR}:/opt/.config/.claude" \
+      -B "${OUTPUT_DIR}:/output" \
+      -B "${STAGING_CLAUDE}:/output/.claude" \
+      -B "${WORKDIR}/workspace:/workspace" \
+      -B "${MADGRAPH_DOCS}:/madgraph_docs:ro" \
+      ${CLAUDE_BIND_ARGS[@]+"${CLAUDE_BIND_ARGS[@]}"} \
+      --overlay "${OVERLAY}" \
+      "${IMAGE}" \
+      "${candidate}"
+  ) >"${APPTAINER_LOG}" 2>&1; then
     SESSION_STARTED=true
     INSTANCE_NAME="${candidate}"
     printf '%s\n' "${INSTANCE_NAME}" > "${WORKDIR}/logs/instance_name.txt"
@@ -407,13 +460,19 @@ if [[ "${ENABLE_DOC_EDITING}" == "1" ]]; then
 fi
 
 # ── Run Claude Code inside the instance ──────────────────────────────
-# --fakeroot is inherited from the instance, so Claude Code sees UID 0.
-# Because of this, --dangerously-skip-permissions cannot be used.
-# Permissions are made fully permissive via settings.local.json instead.
+# Claude Code sees the user's UID (1253) inside the container — not 0.
+# This is intentional: the host-bind-mounted claude binary (Bun) deadlocks
+# under apptainer's LD_PRELOAD/libfakeroot path. Permissions are made
+# fully permissive via settings.local.json instead of
+# --dangerously-skip-permissions (which requires UID 0 and is also blocked
+# by the no-fakeroot setup).
 CLAUDE_ENV_ARGS=()
+CLAUDE_EXTRA_ARGS=()
 if [[ "${ENABLE_DOC_EDITING}" == "1" ]]; then
   # Must be a real process env var (settings.local.json env only reaches subprocesses).
   CLAUDE_ENV_ARGS+=(--env "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1")
+  # Agent teams launch teammates in tmux panes; both must be set together.
+  CLAUDE_EXTRA_ARGS+=(--teammate-mode tmux)
 fi
 "${APPTAINER_BIN}" exec \
   --cleanenv \
@@ -425,7 +484,7 @@ fi
   "instance://${INSTANCE_NAME}" \
   bash -c 'export PATH="/root/.local/bin:${PATH}"; exec "$@"' _ "${CLAUDE_CONTAINER_BIN}" \
   --append-system-prompt "$(cat "${CLAUDE_CODE_DIR}/prompts/system-prompt-append.md")" \
-  --teammate-mode tmux \
+  ${CLAUDE_EXTRA_ARGS[@]+"${CLAUDE_EXTRA_ARGS[@]}"} \
   ${SESSION_ID_ARGS[@]+"${SESSION_ID_ARGS[@]}"} "$@"
 
 # When Claude Code exits, the script exits and the cleanup trap stops the instance.

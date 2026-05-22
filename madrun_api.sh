@@ -120,9 +120,23 @@ export APPTAINERENV_NPM_CONFIG_CACHE="${NPM_CONFIG_CACHE}"
 LOCK_FILE="${RUN_DIR}/.madrun.lock"
 exec {LOCK_FD}>"${LOCK_FILE}" || { echo "ERROR: cannot open lock file ${LOCK_FILE}" >&2; exit 1; }
 if ! flock -n "${LOCK_FD}"; then
-  echo "ERROR: madrun is already running for this clone (lock: ${LOCK_FILE})" >&2
-  exit 1
+  # Lock might be stale: previous run's apptainer daemon inherited the FD
+  # and is still holding it. Check the recorded PID; if dead, kill the
+  # remaining FD holders (the orphan daemon) and retry once.
+  prev_pid="$(head -n1 "${LOCK_FILE}" 2>/dev/null | tr -d '[:space:]')"
+  if [[ -n "${prev_pid}" ]] && kill -0 "${prev_pid}" 2>/dev/null; then
+    echo "ERROR: madrun is already running for this clone (PID ${prev_pid}, lock: ${LOCK_FILE})" >&2
+    exit 1
+  fi
+  echo "WARNING: stale madrun lock detected — killing leftover holders ..." >&2
+  fuser -k "${LOCK_FILE}" 2>/dev/null || true
+  sleep 1
+  if ! flock -n "${LOCK_FD}"; then
+    echo "ERROR: could not acquire madrun lock after cleanup (lock: ${LOCK_FILE})" >&2
+    exit 1
+  fi
 fi
+: >"${LOCK_FILE}"
 printf '%s\n' "$$" 1>&"${LOCK_FD}"
 
 # ---------- port availability ----------
@@ -275,17 +289,21 @@ for i in $(seq 0 999); do
     candidate="${INSTANCE_BASE}-${i}"
   fi
 
-  if "${APPTAINER_BIN}" instance start \
-    --fakeroot \
-    -B "${SRC_DIR}:/MadAgents/src:ro" \
-    -B "${UI_DIR}:/MadAgents/src/madagents/frontend/ui" \
-    -B "${MADGRAPH_DOCS_DIR}:/madgraph_docs:ro" \
-    -B "${output_dir}:/output" \
-    -B "${RUN_DIR}:/runs" \
-    --overlay "${OVERLAY}" \
-    "${IMAGE}" \
-    "${candidate}" \
-    >"${APPTAINER_LOG}" 2>&1; then
+  # Subshell closes LOCK_FD so the daemonized instance does not inherit it
+  # and leave .madrun.lock permanently held after the script exits.
+  if (
+    eval "exec ${LOCK_FD}>&-"
+    "${APPTAINER_BIN}" instance start \
+      --fakeroot \
+      -B "${SRC_DIR}:/MadAgents/src:ro" \
+      -B "${UI_DIR}:/MadAgents/src/madagents/frontend/ui" \
+      -B "${MADGRAPH_DOCS_DIR}:/madgraph_docs:ro" \
+      -B "${output_dir}:/output" \
+      -B "${RUN_DIR}:/runs" \
+      --overlay "${OVERLAY}" \
+      "${IMAGE}" \
+      "${candidate}"
+  ) >"${APPTAINER_LOG}" 2>&1; then
     SESSION_STARTED=true
     INSTANCE_NAME="${candidate}"
     printf '%s\n' "${INSTANCE_NAME}" > "${INSTANCE_NAME_FILE}"
