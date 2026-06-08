@@ -11,8 +11,9 @@ This is the **official implementation** of **MadAgents**.
 
 ## Changelog 🔥
 
+- **[26/06/08]** **Repo-native install + Codex support** — install MadAgents into your own repo and run it directly with **Claude Code or Codex**, no container needed. This is now the recommended setup. See [Quick start](#quick-start-install-into-your-repo). 🔥
 - **[26/04/07]** **Self-improving docs** — MadAgents evaluates itself and refines the MadGraph documentation. See [Self-improving docs](#self-improving-docs). 🔥
-- **[26/03/20]** Released **Claude Code implementation** — run MadAgents as a multi-agent system directly from the terminal, works with a Claude subscription, no API credits needed! See [Quick start (Claude Code)](#quick-start-claude-code). 🔥
+- **[26/03/20]** Released **Claude Code implementation** — run MadAgents as a multi-agent system directly from the terminal, works with a Claude subscription, no API credits needed! See [Containerized version](#containerized-version-apptainer-sandbox). 🔥
 - **[26/03/20]** Added **Anthropic model support** (Claude Opus 4.6, Sonnet 4.6, Haiku 4.5) — switch between OpenAI and Anthropic directly from the UI!
 - **[26/03/20]** New **physics expert** worker for HEP theory and phenomenology, plus **three specialized reviewers** (plan, verification, presentation) for higher-quality answers!
 - **[26/03/20]** **Parallel worker dispatch** — the orchestrator now runs multiple workers concurrently, with full agent traces and an expanded MadGraph documentation library.
@@ -30,21 +31,72 @@ MadAgents is a set of **communicative agents** that support **MadGraph-centered 
 
 ---
 
-## Two ways to run MadAgents
+## Ways to run MadAgents
 
-MadAgents can be used in two modes. Both run inside an Apptainer container.
+The **recommended** way installs MadAgents into your own repo so it runs as a normal
+coding-agent session — with **Claude Code or Codex**, no container required. Two alternatives
+remain for a sandboxed stack or a browser UI.
 
-| | Claude Code | API version |
-| --- | --- | --- |
-| **Interface** | Terminal (CLI) | Web UI (browser) |
-| **Backend** | Claude Code multi-agent system | LangGraph + FastAPI |
-| **Setup** | Claude Code CLI + Apptainer | API keys + Apptainer |
-| **Authentication** | Claude subscription or API credits | OpenAI / Anthropic API keys |
-| **Session management** | `--resume` / `--continue` flags | Browser-based |
+| | **Install (recommended)** | Containerized | Web UI / API |
+| --- | --- | --- | --- |
+| **Interface** | Terminal (Claude Code or Codex) | Terminal (Claude Code) | Web UI (browser) |
+| **Runs** | In your repo (bare) | Apptainer sandbox | LangGraph + FastAPI |
+| **Setup** | `cd install/… && <agent>` | Apptainer + image build | API keys + Apptainer |
+| **Auth** | Claude or Codex sign-in | Claude subscription / credits | OpenAI / Anthropic keys |
+| **Entry point** | [`install/`](install/) | `madrun_code.sh` | `madrun_api.sh` |
 
 ---
 
-## Quick start (Claude Code)
+## Quick start (install into your repo)
+
+Set MadAgents up in any repo using whichever coding agent you prefer, targeting whichever agent
+will run it. No Apptainer and no image build — the agent installs MadGraph itself when a task needs it.
+
+### 0) Requirements
+
+- **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** or **[Codex](https://developers.openai.com/codex)** CLI, installed and authenticated.
+- **git** (the installer locates the MadAgents source via the repo).
+
+### 1) Get the code
+
+Clone or download this repository.
+
+### 2) Run the installer
+
+Open the installer with the agent of your choice, then ask it to install MadAgents:
+
+```bash
+cd install/claude_code && claude     # installer running as Claude Code → /install-madagents
+# or
+cd install/codex && codex            # installer running as Codex → ask it to install MadAgents
+```
+
+It asks **which agent** the target should run (Claude Code or Codex) and **which repo** to set up,
+then writes the configuration plus a `start_madagents.sh` launcher there.
+
+### 3) Launch MadAgents
+
+```bash
+cd <your-repo>
+./start_madagents.sh                 # launches claude or codex with the MadAgents setup
+```
+
+### Updating
+
+Re-run the installer and use **`/update-madagents`**. It does a 3-way merge that preserves any
+edits you made to the installed files.
+
+See [`install/README.md`](install/README.md) for details and
+[`install/data/madagents/`](install/data/madagents/) for the provider-agnostic schema + adapters.
+
+> Prefer a sandbox or a browser UI instead? See **[Containerized version](#containerized-version-apptainer-sandbox)**
+> and **[Web UI / API version](#web-ui--api-version)** below.
+
+---
+
+## Containerized version (Apptainer sandbox)
+
+> A **sandboxed, reproducible** environment with the MadGraph stack preinstalled — handy on HPC, or to keep installs isolated from your host. Runs the Claude Code version inside Apptainer. This is also the mode used for [Self-improving docs](#self-improving-docs) and the batch [`eval/`](eval/) pipeline.
 
 ### 0) Requirements
 
@@ -113,7 +165,9 @@ For automated, batch-style runs (e.g. CI, overnight evaluations), use the host-s
 
 ---
 
-## Quick start (API version)
+## Web UI / API version
+
+> A browser UI backed by LangGraph + FastAPI, using OpenAI/Anthropic **API keys** (not a coding-agent CLI).
 
 ### 0) Requirements
 
