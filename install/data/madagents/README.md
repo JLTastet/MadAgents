@@ -1,79 +1,82 @@
-# MadAgents — Claude Code installer data
+# MadAgents — neutral schema + provider adapters
 
-The **data** the installer skills operate on (templates, the canonical renderer, examples).
-The skills themselves live in the session dir [`../../claude_code/`](../../claude_code/) — run
-Claude Code there and use `/install-madagents` or `/update-madagents`.
+This directory defines **what MadAgents is**, independent of any coding-agent CLI, plus the
+per-provider **adapters** that assemble it into a concrete install. It is the data the
+installer skills operate on — the installer itself lives in [`../installer/`](../installer/),
+and the runnable installer sessions are [`../../claude_code/`](../../claude_code/) and
+[`../../codex/`](../../codex/).
 
-> Scope: Claude Code, default mode only. The verify / doc-editing / eval machinery
-> from the top-level `claude_code/` setup is intentionally left out here.
+> Scope: the **default** MadAgents setup (orchestrator + workers + reviewers). The
+> verify / doc-editing / eval machinery from the top-level `claude_code/` setup is left out here.
 
 ## Layout
 
 ```
-install/
-  claude_code/                           # session dir — run claude here (.claude/ has the skills)
-  data/claude_code/                      # ← this directory: the data the skills use
-    scripts/
-      render.sh                          # canonical renderer (shared by install, example, update)
-    examples/
-      build_example.sh                   # runnable end-to-end bare install + verify
-      verify_install.sh                  # objective pass/fail checks for any install
-    templates/
-      .claude/
-        CLAUDE.md                       # environment + operational context
-        rules/{correctness,mandatory-reviews}.md
-        agents/                         # worker + reviewer fleet (madgraph-operator assembled at render)
-      prompts/
-        system-prompt-append.md         # orchestrator role (passed via --append-system-prompt)
-        madgraph-operator.header.md      # header for the assembled operator card
-      start_madagents.bare.sh            # the launcher (copied verbatim)
-      start_madagents.container.sh       # deferred — see CONTAINER_DEFERRED.md
-  data/claude_code/CONTAINER_DEFERRED.md # what's dormant for the future container mode
+install/data/madagents/
+  agents/*.md                  # provider-agnostic agent defs (name/description frontmatter + body)
+                               #   incl. madgraph-operator.md (a header; the docs overview is appended at render)
+  context.md                   # environment + style (becomes CLAUDE.md / top of AGENTS.md)
+  rules/{correctness,mandatory-reviews}.md
+  orchestrator.md              # the delegation role
+  adapters/
+    claude_code/
+      render.sh                # schema -> .claude payload (CLAUDE.block.md, rules/, agents/*.md, …)
+      launchers/start_madagents.{bare,container}.sh
+      CONTAINER_DEFERRED.md    # container mode is built but not exposed yet
+    codex/
+      render.sh                # schema -> Codex payload (AGENTS.block.md, agents/*.toml, config.toml)
+      agent_to_toml.py         # agent .md -> Codex subagent .toml
+      config.toml  launchers/start_madagents.sh
+  examples/
+    build_example.sh <provider>   # runnable end-to-end install + verify
+    verify_install.sh             # objective pass/fail checks for any install
+    regen_expected.sh / check_expected.sh   # golden-example regen + regression check
+    expected/{claude_code,codex}/ # committed, sanitized golden renders
 ```
 
-## How the templates adapt to each mode
+Agents stay Markdown + `name`/`description` frontmatter (a neutral form both CLIs use). The
+content carries one placeholder, `{{DOCS}}` (the read-only MadGraph docs location), plus
+`<!-- container-only -->` blocks (and a `{{REPO}}` placeholder inside them) for a future
+**container mode** — the bare renderer strips those blocks entirely. See
+`adapters/claude_code/CONTAINER_DEFERRED.md`.
 
-The agent simply works in the user's repo (its cwd), like a normal Claude Code session —
-there is nothing to mount or describe. The templates carry one placeholder, `{{DOCS}}`
-(the read-only MadGraph docs location), which the renderer substitutes to
-`<repo>/.madagents/madgraph_docs`.
+## How each adapter assembles the schema
 
-The templates also contain `<!-- container-only -->` blocks (and a `{{REPO}}` placeholder
-inside them) for a future **container mode**. The bare renderer **strips those blocks
-entirely**, so they never reach a bare install. See `CONTAINER_DEFERRED.md`.
+| Schema element | **claude_code** | **codex** |
+| --- | --- | --- |
+| `agents/*.md` | → `.claude/agents/*.md` | → `.codex/agents/*.toml` (`name`/`description`/`developer_instructions`) |
+| `context.md` | → `.claude/CLAUDE.md` block | → top of `AGENTS.md` |
+| `rules/*` | → `.claude/rules/*` | → appended to `AGENTS.md` |
+| `orchestrator.md` | → `--append-system-prompt` at launch | → appended to `AGENTS.md` |
+| launcher | `start_madagents.sh` → `claude` | `start_madagents.sh` → `codex` |
 
-## Assembled at install time (not stored here)
+The MadAgents content always lives in a `<!-- MadAgents:begin/end -->` block inside
+`CLAUDE.md`/`AGENTS.md`, so an install merges into a user's existing instruction file.
 
-These are produced by the install step, not committed as templates:
+## Produced at install time (not stored here)
 
-1. **`agents/madgraph-operator.md`** — the operator card = `madgraph-operator.header.md`
-   concatenated with the MadGraph software instructions
-   (`src/madagents/software_instructions/madgraph.md`, heading levels shifted by +1).
-   Mirrors `claude_code/scripts/build_madgraph_operator.py`.
-2. **The MadGraph docs** — copied from `src/madagents/software_instructions/madgraph/`
-   into `<repo>/.madagents/madgraph_docs`. Referenced from source, not duplicated here.
-3. **A start script** — `start_madagents.sh` runs `claude --append-system-prompt …` in the
-   repo. It **forwards args and env to Claude**: positional args pass through (`--resume`,
-   `--continue`, …), and `--env KEY=VALUE` (repeatable) sets env vars.
-4. **A manifest** — `<repo>/.madagents/install.json` records the installed version
-   (`git describe`), source commit, mode, and paths. No file snapshot.
+1. **`madgraph-operator`** — the operator card/agent = its header + the MadGraph overview
+   (`src/madagents/software_instructions/madgraph.md`, headings shifted +1).
+2. **The MadGraph docs** — copied from `src/madagents/software_instructions/madgraph/` into
+   `<repo>/.madagents/madgraph_docs`. Referenced from source, not duplicated here.
+3. **A launcher** — `start_madagents.sh` runs `claude`/`codex` in the repo and **forwards args
+   and env** (positional args pass through; `--env KEY=VALUE` sets env vars).
+4. **A manifest** — `<repo>/.madagents/install.json` records the source **commit id** +
+   `provider` + version label. No base snapshot is stored.
 
 ## Updating
 
-`update-madagents` updates an existing install while preserving the user's edits via a
-**3-way merge**. Because nothing pristine is stored locally (a user could edit it), the merge
-**base** — the original of the installed version — is *reconstructed* by rendering that
-version's templates from git history (`git archive <source_commit>`). Per file:
-
-- `current == base` (untouched) → take the new version
-- user-edited only → keep theirs
-- both changed → `git merge-file` (clean merge keeps both; overlap → conflict markers + `.orig` backup)
-
-This applies to **everything** installed (agents, rules, the CLAUDE.md block, docs, launcher).
-The user's own files and content outside the CLAUDE block are never touched.
-`install-madagents` detects an existing install (manifest or markers) and refers the user here.
+`update-madagents` updates an install while preserving the user's edits via a **3-way merge**.
+Because nothing pristine is stored in the target, the merge **base** (the original of the
+installed version) is *reconstructed* by re-rendering the schema at the recorded commit
+(`git archive <source_commit> -- install/data/madagents src/madagents/software_instructions`).
+Per file: `current == base` → take new; user-edited only → keep theirs; both changed →
+`git merge-file` (clean merge keeps both; overlap → conflict markers + `.orig` backup). This
+applies to everything installed (agents, rules, the instruction block, docs, launcher) and is
+provider-aware.
 
 ## Status
 
-Bare install + update are implemented and validated. Container mode is built but deferred
-(see `CONTAINER_DEFERRED.md`). A Codex installer is separate, future work.
+Bare install + update are implemented and validated for **both providers** (Claude Code and
+Codex). Container mode is built but deferred (see
+`adapters/claude_code/CONTAINER_DEFERRED.md`).
