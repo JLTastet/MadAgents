@@ -55,11 +55,15 @@ VLLM_DEFAULT_MAX_OUTPUT: int = 4096
 # Floor below which we refuse to invoke — summarizer should have fired.
 VLLM_MIN_OUTPUT: int = 1024
 
-# Reserved output budget for the summarizer when it fires. The summarizer's
-# trigger threshold in ``config._apply_vllm_summarizer_defaults`` is derived
-# as ``MAX_MODEL_LEN - VLLM_MAX_SUMMARIZER_OUTPUT`` so the summary can always
-# fit once the conversation reaches the trigger.
-VLLM_MAX_SUMMARIZER_OUTPUT: int = 8_192
+# Reserved output budget for the summarizer when it fires. The trigger threshold
+# in ``config._apply_vllm_summarizer_defaults`` is ``MAX_MODEL_LEN -
+# VLLM_MAX_SUMMARIZER_OUTPUT``, so when the conversation reaches the trigger
+# there is this much room left in the context window for the summarizer to write
+# its summary. It does not, by itself, prevent a single oversized tool result
+# from overflowing the window when the summarizer cannot shrink the prompt; that
+# preserved-tail case is caught by the dynamic-max backstop in
+# ``compute_dynamic_max_tokens``.
+VLLM_MAX_SUMMARIZER_OUTPUT: int = int(os.environ.get("VLLM_MAX_SUMMARIZER_OUTPUT", "3072"))
 
 # Per-agent ceilings. Use ``None`` to let an agent consume all remaining
 # context (e.g. summarizer, whose output can legitimately grow with input).
@@ -99,8 +103,23 @@ def _check_agent_output_ceilings() -> None:
             )
 
 
+def _check_summarizer_output_within_window() -> None:
+    """The reserve must be a positive fraction of the context window. Otherwise
+    the derived threshold ``MAX_MODEL_LEN - VLLM_MAX_SUMMARIZER_OUTPUT`` is <= 0
+    (the gate fires every turn) or >= MAX_MODEL_LEN (the gate never fires). This
+    guards a misconfigured ``VLLM_MAX_SUMMARIZER_OUTPUT`` env override.
+    """
+    if not 0 < VLLM_MAX_SUMMARIZER_OUTPUT < MAX_MODEL_LEN:
+        raise RuntimeError(
+            f"vllm_tokens misconfigured: VLLM_MAX_SUMMARIZER_OUTPUT "
+            f"({VLLM_MAX_SUMMARIZER_OUTPUT}) must be in the open interval "
+            f"(0, MAX_MODEL_LEN={MAX_MODEL_LEN})."
+        )
+
+
 _check_min_output_below_summarizer_output()
 _check_agent_output_ceilings()
+_check_summarizer_output_within_window()
 
 
 def summarizer_token_threshold() -> int:
@@ -296,9 +315,10 @@ def compute_dynamic_max_tokens(
         ``VLLM_MIN_OUTPUT`` — this is only reachable after the summarizer
         should already have fired (enforced by the module-load invariant
         ``VLLM_MIN_OUTPUT < VLLM_MAX_SUMMARIZER_OUTPUT``).
-      * Log WARNING for non-summarizer agents when ``prompt_tokens`` has
-        already crossed ``summarizer_token_threshold()`` — the summarizer
-        should have fired before this call but didn't.
+      * Log WARNING for non-summarizer agents when ``prompt_tokens`` reaches
+        ``summarizer_token_threshold()``. This is expected only when summarization
+        fired but could not shrink the prompt; without a coincident can't-shrink
+        warning, the gate under-counted, which is a bug.
 
     Note: the caller-configured ``max_tokens`` (from ``create_chat_model``) is
     deliberately *not* consulted here. Every MadAgents caller hardcodes
@@ -329,15 +349,18 @@ def compute_dynamic_max_tokens(
     ceiling = VLLM_AGENT_OUTPUT_CEILINGS.get(agent_name, VLLM_DEFAULT_MAX_OUTPUT)  # type: ignore[arg-type]
     dynamic = remaining if ceiling is None else min(remaining, ceiling)
 
-    # The summarizer is itself the remedy for large prompts, so it never
-    # warns about itself. For everyone else, warn only when the summarizer
-    # should already have fired — i.e. prompt_tokens has crossed the trigger.
+    # The summarizer never warns about itself (it is the remedy). For other
+    # agents this fires only if the prompt is still over the trigger at invoke
+    # time, which should mean summarization ran but couldn't shrink it.
     if agent_name != "summarizer" and prompt_tokens >= summarizer_trigger:
         logger.warning(
-            "vllm_tokens: prompt=%d has crossed summarizer trigger %d but "
-            "agent=%s is still invoking without summarization (dynamic "
-            "max_tokens=%d). Summarization should happen before the next call.",
-            prompt_tokens, summarizer_trigger, agent_name, dynamic,
+            "vllm_tokens: prompt=%d (agent=%s) is at or above the summarizer "
+            "trigger %d at invoke time (dynamic max_tokens=%d). This is expected "
+            "only when summarization fired but could not shrink the prompt (an "
+            "oversized tool result in the preserved tail); look for a coincident "
+            "summarizer can't-shrink warning. If there is none, the gate "
+            "under-counted, which is a bug.",
+            prompt_tokens, agent_name, summarizer_trigger, dynamic,
         )
     return dynamic
 

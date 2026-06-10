@@ -1,5 +1,6 @@
 from typing import Any, Tuple
 
+import logging
 import math
 import json
 import re
@@ -8,6 +9,8 @@ from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, ToolMe
 
 from madagents.llm import LLMRuntime, get_default_runtime
 from madagents.utils import response_to_text
+
+logger = logging.getLogger(__name__)
 
 #########################################################################
 ## Prompt ###############################################################
@@ -51,6 +54,10 @@ Key paths, configurations, software versions, active sessions. Filesystem/enviro
 #########################################################################
 ## Agent ################################################################
 #########################################################################
+
+# Prepended to count an assistant-led slice: vLLM rejects a message list with no
+# user query. Subtracting its standalone cost recovers the slice's own tokens.
+_DUMMY_USER = HumanMessage(content=".")
 
 class Summarizer:
     """Summarize conversation history to stay within token limits."""
@@ -119,8 +126,9 @@ class Summarizer:
         min_tail_tokens = (
             min_tail_tokens if isinstance(min_tail_tokens, int) else self.min_tail_tokens
         )
-        # Short-circuit if we're still under budget.
-        if approx_tokens_in_messages(messages[prev_non_summary_start:]) <= token_threshold:
+        # Short-circuit if still under budget. token_threshold is a full-prompt
+        # budget, so the gate measures the full prompt (see _prompt_tokens).
+        if self._prompt_tokens(messages[prev_non_summary_start:]) <= token_threshold:
             return prev_summary, prev_non_summary_start
 
         new_non_summary_start = _safe_tail_start_index(
@@ -130,13 +138,97 @@ class Summarizer:
             min_tail_tokens=min_tail_tokens,
         )
 
-        # Nothing to summarize (can't shrink further without touching the tail)
+        # The gate fired, but the preserved tail (keep_last_messages /
+        # min_tail_tokens / tool-pair adjacency) already reaches the boundary, so
+        # the prompt cannot be shrunk. This is usually caused by a single oversized
+        # tool result. The runtime's dynamic-max cap is the backstop against actual
+        # context overflow.
         if new_non_summary_start <= prev_non_summary_start:
+            logger.warning(
+                "summarizer: the prompt is over token_threshold=%d but cannot be "
+                "shrunk; the preserved tail already starts at index %d (likely a "
+                "large recent tool result). The prompt may approach the context limit.",
+                token_threshold, prev_non_summary_start,
+            )
             return prev_summary, prev_non_summary_start
 
         to_summarize = messages[prev_non_summary_start:new_non_summary_start]
         new_summary = self._summarize(prev_summary, to_summarize)
         return new_summary, new_non_summary_start
+
+    def _prompt_tokens(self, messages: list[BaseMessage]) -> int:
+        """Exact full-prompt token count for the gate (vLLM), else char heuristic.
+
+        The slice excludes the preamble, tools, and summary, so count
+        incrementally: take the recorded prompt size of the most recent reply
+        (its ``usage_metadata.input_tokens``, which already counts them) and add
+        the exact size of that reply plus the messages appended since. Recounting
+        from the reply rather than adding its ``output_tokens`` measures its
+        closing template tokens, so the estimate never under-counts.
+        """
+        if not messages:
+            return 0
+        dummy = self._dummy_user_tokens()
+        if dummy is None:
+            # The runtime has no exact token counter; fall back to the heuristic.
+            return approx_tokens_in_messages(messages)
+
+        for i in range(len(messages) - 1, -1, -1):
+            base = _exact_input(messages[i])
+            if base is not None:
+                # Tripwire for a compacted (cross-context) anchor. Sound and
+                # false-positive-free: in the consistent case ``base`` is the
+                # preamble + tools + summary + these preceding messages, so it always
+                # exceeds their size; only a compacted anchor can fall below it.
+                if base < approx_tokens_in_messages(messages[:i]):
+                    logger.warning(
+                        "summarizer: anchor input_tokens=%d is below the heuristic "
+                        "size of the %d message(s) before it in this slice; the "
+                        "anchor's prompt was compacted relative to the slice, so the "
+                        "gate under-counts (likely a re-dispatched sub-agent that "
+                        "internally summarized).",
+                        base, i,
+                    )
+                return base + self._slice_tokens(messages[i:], dummy)
+
+        # No recorded reply in the slice. This is normal when the slice is small:
+        # a fresh slice, or one holding only synthetic display messages (the
+        # orchestrator builds AIMessages without usage_metadata). A slice large
+        # enough to fire the gate with no anchor is suspicious, since real replies
+        # carry input_tokens.
+        slice_tokens = self._slice_tokens(messages, dummy)
+        if slice_tokens >= self.token_threshold and any(isinstance(m, AIMessage) for m in messages):
+            logger.warning(
+                "summarizer: the gate slice reaches the threshold (%d tokens) but "
+                "none of its assistant messages carry usage_metadata input_tokens; "
+                "the metadata may have been stripped.",
+                slice_tokens,
+            )
+        return slice_tokens
+
+    def _slice_tokens(self, messages: list[BaseMessage], dummy: int) -> int:
+        """Token count of ``messages`` as rendered in context, tools-free.
+
+        Prepends ``_DUMMY_USER`` (vLLM rejects a list with no user query) and
+        subtracts its standalone cost. This is exact for an assistant-led tail
+        when the chat template renders message blocks additively, so the
+        difference is the slice's own contribution (verified for Qwen3.5; a
+        template that merges adjacent same-role turns would make it approximate).
+        Tools-free because the anchor's ``input_tokens`` already counts the tool
+        schemas.
+        """
+        n = self.runtime.count_tokens([_DUMMY_USER, *messages])
+        assert n is not None  # dummy is not None, so the tokenizer returns an int
+        return n - dummy
+
+    def _dummy_user_tokens(self) -> int | None:
+        """Token cost of ``_DUMMY_USER``, cached. ``None`` means the runtime's
+        ``count_tokens`` returns ``None`` (no exact token counter), so the caller
+        falls back to the char heuristic.
+        """
+        if not hasattr(self, "_dummy_user_token_cache"):
+            self._dummy_user_token_cache = self.runtime.count_tokens([_DUMMY_USER])
+        return self._dummy_user_token_cache
 
 #########################################################################
 ## Approximate token count ##############################################
@@ -378,6 +470,17 @@ def _ai_output_tokens_from_usage(m: BaseMessage) -> int | None:
         if total > 0:
             return total
     return None
+
+def _exact_input(m: BaseMessage) -> int | None:
+    """Recorded prompt size (``usage_metadata.input_tokens``) of the call that
+    produced ``m``, or None. Already counts the preamble, tools, summary, and the
+    history before the reply.
+    """
+    usage = getattr(m, "usage_metadata", None)
+    if not isinstance(usage, dict):
+        return None
+    input_tokens = usage.get("input_tokens")
+    return input_tokens if isinstance(input_tokens, int) and input_tokens > 0 else None
 
 #########################################################################
 ## Get summary tail #####################################################

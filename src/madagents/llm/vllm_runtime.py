@@ -409,6 +409,24 @@ class VLLMRuntime(LLMRuntime):
     def bind_reasoning_trace(self, llm: Any) -> Any:
         return llm  # No-op — encrypted reasoning traces are OpenAI-specific
 
+    def count_tokens(
+        self,
+        messages: list[BaseMessage],
+        *,
+        tools: list | None = None,
+        chat_template_kwargs: dict | None = None,
+    ) -> int:
+        """Exact prompt-token count for ``messages`` via vLLM's ``/tokenize``.
+
+        A ``/tokenize`` failure raises ``RuntimeError`` (from
+        ``count_prompt_tokens``) and is deliberately not caught: a broken local
+        tokenizer is a real fault that must surface, not silently degrade the
+        summarizer gate to a heuristic.
+        """
+        return vllm_tokens.count_prompt_tokens(
+            messages, tools=tools, chat_template_kwargs=chat_template_kwargs,
+        )
+
     def invoke(
         self,
         llm: Any,

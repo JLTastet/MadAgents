@@ -34,6 +34,22 @@ class LLMRuntime(Protocol):
     def bind_reasoning_trace(self, llm: Any) -> Any:
         """Bind request options needed for encrypted reasoning traces."""
 
+    def count_tokens(
+        self,
+        messages: list[BaseMessage],
+        *,
+        tools: list | None = None,
+        chat_template_kwargs: dict | None = None,
+    ) -> int | None:
+        """Exact prompt-token count for ``messages``, or ``None`` if unsupported.
+
+        Providers with a server-side tokenizer (e.g. vLLM's ``/tokenize``)
+        override this; the concrete default returns ``None`` so callers fall back
+        to a heuristic. ``tools`` and ``chat_template_kwargs`` mirror what the
+        provider would send so the count matches the rendered prompt.
+        """
+        return None
+
     def invoke(
         self,
         llm: Any,
