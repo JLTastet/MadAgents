@@ -30,3 +30,4 @@ claude_code/archive
 .nfs*
 archive/
 .apptainer_tmp
+py.py
