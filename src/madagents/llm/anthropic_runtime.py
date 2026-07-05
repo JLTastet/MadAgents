@@ -15,11 +15,19 @@ from madagents.tools import (
 ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS = 64_000
 ANTHROPIC_OPUS_46_MAX_OUTPUT_TOKENS = 128_000
 
-_ADAPTIVE_THINKING_MODELS = {"claude-opus-4-6", "claude-sonnet-4-6"}
+_ADAPTIVE_THINKING_MODELS = {
+    "claude-opus-4-6",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-sonnet-4-6",
+}
 
 
 def _supports_adaptive_thinking(model: str) -> bool:
-    """Check if model supports adaptive thinking (4.6 models)."""
+    """Whether the model uses adaptive thinking (Opus 4.6+ / Sonnet 4.6).
+
+    Opus 4.7/4.8 require it. They reject ``thinking={"type": "enabled", ...}``.
+    """
     normalized = (model or "").strip().lower()
     return any(m in normalized for m in _ADAPTIVE_THINKING_MODELS)
 
@@ -36,6 +44,10 @@ def _map_effort_for_adaptive(reasoning_effort: str) -> str | None:
         return "low"
     if effort == "medium":
         return "medium"
+    if effort == "xhigh":
+        return "xhigh"
+    if effort == "max":
+        return "max"
     return "high"  # "high" or anything else
 
 

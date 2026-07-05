@@ -10,6 +10,9 @@ SUPPORTED_MODELS: List[str] = [
     "gpt-5.1",
     "gpt-5.2",
     "gpt-5.4",
+    "gpt-5.5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
     "claude-opus-4-6",
     "claude-sonnet-4-6",
     "claude-haiku-4-5",
@@ -20,7 +23,9 @@ SUPPORTED_MODELS: List[str] = [
 SUPPORTED_PROVIDERS: List[str] = ["openai", "anthropic", "vllm"]
 
 VERBOSITY_LEVELS: List[str] = ["low", "medium", "high"]
-REASONING_EFFORT_LEVELS: List[str] = ["minimal", "low", "medium", "high"]
+# "xhigh"/"max" are Anthropic-only levels (Opus 4.7+ / 4.6+); OpenAI tops out at
+# "high", so do not assign them to an openai-backed agent.
+REASONING_EFFORT_LEVELS: List[str] = ["minimal", "low", "medium", "high", "xhigh", "max"]
 
 OPENAI_MODEL_PREFIXES: tuple[str, ...] = ("gpt-",)
 ANTHROPIC_MODEL_PREFIXES: tuple[str, ...] = ("claude-",)
@@ -32,12 +37,15 @@ VLLM_MODELS: List[str] = [m for m in SUPPORTED_MODELS if m.startswith(VLLM_MODEL
 
 # Model capability tiers for orchestrator routing decisions.
 ANTHROPIC_MODEL_TIERS: Dict[str, tuple[str, str]] = {
+    "claude-opus-4-8": ("strongest", "Complex reasoning, physics, domain expertise, code generation, failed retries"),
+    "claude-opus-4-7": ("strongest", "Complex reasoning, physics, domain expertise, code generation, failed retries"),
     "claude-opus-4-6": ("strongest", "Complex reasoning, physics, domain expertise, code generation, failed retries"),
     "claude-sonnet-4-6": ("mid-tier", "Read-only research, formatting, scratch-space work"),
     "claude-haiku-4-5": ("lightest", "Simple extraction, formatting, lookups, straightforward file ops"),
 }
 
 OPENAI_MODEL_TIERS: Dict[str, tuple[str, str]] = {
+    "gpt-5.5": ("strongest", "Complex reasoning, physics, domain expertise, code generation, failed retries"),
     "gpt-5.4": ("strongest", "Complex reasoning, physics, domain expertise, code generation, failed retries"),
     "gpt-5.2": ("strongest", "Complex reasoning, physics, domain expertise, code generation, failed retries"),
     "gpt-5.1": ("strongest", "Complex reasoning, physics, domain expertise, code generation, failed retries"),
@@ -86,8 +94,8 @@ _ALL_MODEL_TIERS: Dict[str, tuple[str, str]] = {
 }
 
 
-DEFAULT_STRONGEST_OPENAI_MODEL: str = "gpt-5.2"
-DEFAULT_STRONGEST_ANTHROPIC_MODEL: str = "claude-opus-4-6"
+DEFAULT_STRONGEST_OPENAI_MODEL: str = "gpt-5.5"
+DEFAULT_STRONGEST_ANTHROPIC_MODEL: str = "claude-opus-4-8"
 DEFAULT_STRONGEST_VLLM_MODEL: str = "qwen3.5-27b"
 
 

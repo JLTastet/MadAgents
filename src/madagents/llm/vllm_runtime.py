@@ -35,6 +35,8 @@ _THINKING_CONTROL: dict[str, dict[str, dict]] = {
         "low":     {"chat_template_kwargs": {"enable_thinking": False}},
         "medium":  {"chat_template_kwargs": {"enable_thinking": True}},
         "high":    {"chat_template_kwargs": {"enable_thinking": True}},
+        "xhigh":   {"chat_template_kwargs": {"enable_thinking": True}},
+        "max":     {"chat_template_kwargs": {"enable_thinking": True}},
     },
     # "gpt-oss": {...},  # when we add it
 }
