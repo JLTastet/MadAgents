@@ -12,6 +12,7 @@ from madagents.config import REASONING_EFFORT_LEVELS
 from madagents.llm import trace_recorder, vllm_patches  # noqa: F401  -- vllm_patches installs reasoning_content patch on import
 from madagents.llm import vllm_tokens
 from madagents.llm.runtime import LLMRuntime
+from madagents.tools import local_read_pdf_tool, local_web_search_tool
 
 logger = logging.getLogger(__name__)
 
@@ -390,7 +391,18 @@ class VLLMRuntime(LLMRuntime):
         node_tools: list = []
         for tool in tools:
             if isinstance(tool, dict):
-                continue  # Strip web_search and other provider-specific dict tools
+                if tool.get("type") == "web_search":
+                    # Provider-native web search has no vLLM equivalent;
+                    # substitute the locally-executed SearXNG-backed tool.
+                    llm_tools.append(local_web_search_tool)
+                    node_tools.append(local_web_search_tool)
+                continue  # Strip other provider-specific dict tools
+            if getattr(tool, "name", None) == "read_pdf":
+                # The default read_pdf variants return base64 content blocks
+                # that vLLM rejects; substitute the local markdown converter.
+                llm_tools.append(local_read_pdf_tool)
+                node_tools.append(local_read_pdf_tool)
+                continue
             llm_tools.append(tool)
             node_tools.append(tool)
         return llm_tools, node_tools

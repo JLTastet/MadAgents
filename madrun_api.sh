@@ -129,6 +129,12 @@ export APPTAINERENV_MADAGENTS_TRIAL_ID="${MADAGENTS_TRIAL_ID:-}"
 export APPTAINERENV_MADAGENTS_TOKENIZER_REVISION="${MADAGENTS_TOKENIZER_REVISION:-}"
 export APPTAINERENV__MADAGENTS_ENABLE_TRACE="${_MADAGENTS_ENABLE_TRACE:-}"
 
+# Forward the local-tool env vars (vLLM runtime: SearXNG-backed web_search and
+# docling-backed read_pdf). DOCLING_ARTIFACTS_PATH defaults to the in-overlay
+# model install location.
+export APPTAINERENV_MADAGENTS_SEARXNG_URL="${MADAGENTS_SEARXNG_URL:-}"
+export APPTAINERENV_DOCLING_ARTIFACTS_PATH="${DOCLING_ARTIFACTS_PATH:-/opt/docling-models}"
+
 # ---------- lock (prevent simultaneous runs in same clone) ----------
 LOCK_FILE="${RUN_DIR}/.madrun.lock"
 exec {LOCK_FD}>"${LOCK_FILE}" || { echo "ERROR: cannot open lock file ${LOCK_FILE}" >&2; exit 1; }
