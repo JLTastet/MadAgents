@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import IO, Any
 
 from langchain_core.messages import AIMessage, BaseMessage
-from langchain_openai.chat_models.base import _convert_message_to_dict
+from langchain_openai.chat_models import base as lc_base
 
 logger = logging.getLogger(__name__)
 
@@ -63,10 +63,12 @@ def _now_iso_ms() -> str:
 def _output_message_to_dict(msg: AIMessage) -> dict[str, Any]:
     """Extract a flat OpenAI-style assistant message + flat ``reasoning_content``.
 
-    We do **not** round-trip through ``_convert_message_to_dict`` because that
-    function drops ``additional_kwargs["reasoning_content"]`` on outbound (the
-    LangChain behaviour the parity argument depends on). Instead we read
-    directly from the AIMessage attributes.
+    We do **not** round-trip through ``_convert_message_to_dict`` because the
+    output message must carry ``reasoning_content`` unconditionally: it is the
+    training-side completion record. The converter only emits reasoning (as
+    the wire key ``reasoning``, via the ``vllm_patches`` replay patch) when
+    the served model preserves historical thinking — reading the AIMessage
+    attributes directly keeps the capture correct either way.
 
     Example::
 
@@ -101,6 +103,17 @@ def _output_message_to_dict(msg: AIMessage) -> dict[str, Any]:
     rc = additional.get("reasoning_content")
     if isinstance(rc, str) and rc:
         out["reasoning_content"] = rc
+
+    # Canary: the wire only carries the coerced shape of malformed tool
+    # calls, so preserve the raw form stashed by vllm_patches on the record.
+    malformed = additional.get("malformed_tool_calls")
+    if malformed:
+        out["malformed_tool_calls"] = list(malformed)
+        logger.warning(
+            "TraceRecorder: output message carries %d malformed tool call(s); "
+            "raw form kept on the record under 'malformed_tool_calls'.",
+            len(malformed),
+        )
     return out
 
 
@@ -301,8 +314,9 @@ class TraceRecorder:
 
         # OpenAI-shape input messages — same converter vllm_tokens uses for
         # the /tokenize body, so what the recorder writes matches what the
-        # audit script (validate_trace_retokenize.py) re-POSTs.
-        input_dicts = [_convert_message_to_dict(m) for m in input_messages]
+        # audit script (validate_trace_retokenize.py) re-POSTs. The attribute
+        # lookup resolves the vllm_patches wrapper at call time.
+        input_dicts = [lc_base._convert_message_to_dict(m) for m in input_messages]
 
         # tools are deep-copied so mutations to the live binding's tool dicts
         # (e.g. prompt-engineering experiments that patch a description) don't

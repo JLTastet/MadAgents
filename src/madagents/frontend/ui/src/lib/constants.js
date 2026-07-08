@@ -47,6 +47,7 @@ export const SUPPORTED_MODELS = [
   "claude-haiku-4-5",
   "qwen3.5-4b",
   "qwen3.5-27b",
+  "qwen3.6-27b",
 ];
 
 export const MODEL_PROVIDER_PREFIXES = {
@@ -141,6 +142,7 @@ const MODEL_TIERS = {
   "claude-sonnet-4-6": "mid-tier",
   "claude-haiku-4-5": "lightest",
   "qwen3.5-27b": "strongest",
+  "qwen3.6-27b": "strongest",
   "qwen3.5-4b": "lightest",
 };
 
@@ -169,7 +171,7 @@ export function strongestModelForProvider(orchestratorModel, provider) {
   const tier = MODEL_TIERS[orchestratorModel] || "unknown";
   if (tier === "strongest") return orchestratorModel;
   if (provider === "anthropic") return "claude-opus-4-6";
-  if (provider === "vllm") return "qwen3.5-27b";
+  if (provider === "vllm") return "qwen3.6-27b";
   return "gpt-5.2";
 }
 

@@ -178,9 +178,11 @@ def _post_tokenize(body: dict[str, Any], *, timeout: float = 60.0) -> int:
             f"vllm_tokens: POST {_tokenize_url()} returned HTTP {e.code}: "
             f"{body_excerpt}"
         ) from e
-    except urllib.error.URLError as e:
+    except (OSError, ValueError) as e:
+        # OSError covers URLError and mid-read socket timeouts; ValueError
+        # covers a non-JSON response body.
         raise RuntimeError(
-            f"vllm_tokens: POST {_tokenize_url()} failed: {e.reason}"
+            f"vllm_tokens: POST {_tokenize_url()} failed: {e}"
         ) from e
     try:
         return int(out["count"])
@@ -188,6 +190,85 @@ def _post_tokenize(body: dict[str, Any], *, timeout: float = 60.0) -> int:
         raise RuntimeError(
             f"vllm_tokens: unexpected /tokenize response shape: {out!r}"
         ) from e
+
+
+# ---------------------------------------------------------------------------
+# preserve_thinking capability
+# ---------------------------------------------------------------------------
+
+_PRESERVE_THINKING_ENV = "VLLM_PRESERVE_THINKING"
+
+# A historical assistant turn carrying reasoning before a trailing user
+# query: the default render drops the reasoning while preserve_thinking
+# renders it, so the token-count differential is the capability signal.
+_PRESERVE_THINKING_PROBE: list[dict[str, str]] = [
+    {"role": "user", "content": "ping"},
+    {"role": "assistant", "content": "pong",
+     "reasoning": "The user pings; I should reply pong."},
+    {"role": "user", "content": "ping again"},
+]
+
+_preserve_thinking_cache: bool | None = None
+
+
+def preserve_thinking_enabled() -> bool:
+    """Whether the served model's chat template honours ``preserve_thinking``.
+
+    ``VLLM_PRESERVE_THINKING=1``/``0`` forces the verdict without probing;
+    otherwise autodetect by tokenizing a fixed conversation with and without
+    the kwarg. Cached once resolved; a probe failure raises RuntimeError
+    (not cached, so the next call retries). Runs per request, never at
+    startup: the sole production caller is the replay patch in
+    ``vllm_patches``.
+    """
+    global _preserve_thinking_cache
+    if _preserve_thinking_cache is not None:
+        return _preserve_thinking_cache
+
+    env = os.environ.get(_PRESERVE_THINKING_ENV, "").strip()
+    if env and env not in ("0", "1"):
+        raise RuntimeError(
+            f"vllm_tokens: {_PRESERVE_THINKING_ENV}={env!r} is invalid; "
+            f"use '1' or '0', or leave unset to autodetect."
+        )
+    if env:
+        enabled = env == "1"
+        logger.info(
+            "vllm_tokens: preserve_thinking %s (forced via %s=%s)",
+            "enabled" if enabled else "disabled", _PRESERVE_THINKING_ENV, env,
+        )
+    else:
+        # Short timeout: fail the calling request quickly with a clear error.
+        try:
+            base = _post_tokenize({
+                "messages": _PRESERVE_THINKING_PROBE,
+                "add_generation_prompt": True,
+            }, timeout=5.0)
+            preserved = _post_tokenize({
+                "messages": _PRESERVE_THINKING_PROBE,
+                "add_generation_prompt": True,
+                "chat_template_kwargs": {"preserve_thinking": True},
+            }, timeout=5.0)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"preserve_thinking autodetect probe failed: {exc}. Ensure "
+                f"the vLLM server is up, or set {_PRESERVE_THINKING_ENV}=1/0 "
+                f"to skip the probe."
+            ) from exc
+        enabled = preserved != base
+        logger.info(
+            "vllm_tokens: preserve_thinking %s (autodetected via /tokenize "
+            "probe: %d tokens without the kwarg vs %d with it)",
+            "enabled" if enabled else "disabled", base, preserved,
+        )
+    _preserve_thinking_cache = enabled
+    return enabled
+
+
+def _reset_preserve_thinking_for_tests() -> None:
+    """Clear the cached capability. Test-only — never call from production code."""
+    global _preserve_thinking_cache
+    _preserve_thinking_cache = None
 
 
 # ---------------------------------------------------------------------------
@@ -229,11 +310,13 @@ def _extract_chat_template_kwargs(llm: Any) -> dict[str, Any]:
     """Return chat_template_kwargs from any ``extra_body`` binding on ``llm``.
 
     ``bind_reasoning`` injects ``extra_body={"chat_template_kwargs":
-    {"enable_thinking": ...}}``, which changes how vLLM renders the prompt.
-    The /tokenize request body must carry the same kwargs or the count will
-    diverge from what /chat/completions reports for the same input (e.g.
-    Qwen's template emits an empty ``<think></think>`` block when thinking
-    is disabled, roughly +2 tokens).
+    {"enable_thinking": ..., "preserve_thinking": ...}}``, which changes how
+    vLLM renders the prompt. The /tokenize request body must carry the same
+    kwargs or the count will diverge from what /chat/completions reports for
+    the same input (e.g. Qwen's template emits an empty ``<think></think>``
+    block when thinking is disabled, and renders historical ``<think>``
+    blocks when ``preserve_thinking`` is on). Returning the whole dict keeps
+    every bound key riding along without per-key plumbing.
 
     Walks outward-to-inward and returns the first match; does not merge
     nested bindings. This matches the actual bind semantics of our current

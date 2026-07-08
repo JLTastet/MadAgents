@@ -122,6 +122,18 @@ def _bind_extra_body(llm: Any, updates: dict[str, Any]) -> Any:
     return llm.bind(extra_body=merged)
 
 
+def _default_template_kwargs() -> dict[str, Any]:
+    """The ``chat_template_kwargs`` every agent request carries by default.
+
+    ``VLLM_PRESERVE_THINKING=0`` is a full kill switch: on Qwen3.6 the kwarg
+    alone renders empty think blocks on historical turns, so a clean baseline
+    needs it gone entirely.
+    """
+    if os.environ.get("VLLM_PRESERVE_THINKING", "").strip() == "0":
+        return {}
+    return {"preserve_thinking": True}
+
+
 def _extract_sampling_params(llm: Any) -> dict[str, Any]:
     """Return sampling params reflecting what's actually bound for the call.
 
@@ -412,7 +424,18 @@ class VLLMRuntime(LLMRuntime):
         return _bind_extra_body(llm, _THINKING_CONTROL[family][effort])
 
     def bind_reasoning_trace(self, llm: Any) -> Any:
-        return llm  # No-op — encrypted reasoning traces are OpenAI-specific
+        """Bind ``preserve_thinking`` so historical think blocks render.
+
+        Encrypted reasoning traces are OpenAI-specific, so none are requested
+        here; but this is the one binding hook every agent's tool-bound LLM
+        passes through (the planner never calls ``bind_reasoning``), so the
+        template kwarg is injected here, without probing the server.
+        Templates that lack the flag (Qwen3.5) ignore it.
+        """
+        ctk = _default_template_kwargs()
+        if not ctk:
+            return llm
+        return _bind_extra_body(llm, {"chat_template_kwargs": ctk})
 
     def count_tokens(
         self,
@@ -423,11 +446,17 @@ class VLLMRuntime(LLMRuntime):
     ) -> int:
         """Exact prompt-token count for ``messages`` via vLLM's ``/tokenize``.
 
-        A ``/tokenize`` failure raises ``RuntimeError`` (from
-        ``count_prompt_tokens``) and is deliberately not caught: a broken local
-        tokenizer is a real fault that must surface, not silently degrade the
-        summarizer gate to a heuristic.
+        ``chat_template_kwargs=None`` counts with the kwargs every agent
+        request carries by default, so gate counts match production renders
+        (a bare render would under-count replayed reasoning on Qwen3.6);
+        pass ``{}`` explicitly to count a bare render. A ``/tokenize``
+        failure raises ``RuntimeError`` (from ``count_prompt_tokens``) and is
+        deliberately not caught: a broken local tokenizer is a real fault
+        that must surface, not silently degrade the summarizer gate to a
+        heuristic.
         """
+        if chat_template_kwargs is None:
+            chat_template_kwargs = _default_template_kwargs()
         return vllm_tokens.count_prompt_tokens(
             messages, tools=tools, chat_template_kwargs=chat_template_kwargs,
         )

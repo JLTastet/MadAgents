@@ -18,6 +18,7 @@ SUPPORTED_MODELS: List[str] = [
     "claude-haiku-4-5",
     "qwen3.5-4b",
     "qwen3.5-27b",
+    "qwen3.6-27b",
 ]
 
 SUPPORTED_PROVIDERS: List[str] = ["openai", "anthropic", "vllm"]
@@ -56,6 +57,7 @@ OPENAI_MODEL_TIERS: Dict[str, tuple[str, str]] = {
 # Per-model-family tier dicts for vLLM-served models.
 # VLLM_MODEL_TIERS is the union, used by _ALL_MODEL_TIERS and routing.
 QWEN_MODEL_TIERS: Dict[str, tuple[str, str]] = {
+    "qwen3.6-27b": ("strongest", "Complex reasoning, physics, domain expertise, code generation"),
     "qwen3.5-27b": ("strongest", "Complex reasoning, physics, domain expertise, code generation"),
     "qwen3.5-4b": ("lightest", "Simple extraction, formatting, lookups"),
 }
@@ -96,7 +98,7 @@ _ALL_MODEL_TIERS: Dict[str, tuple[str, str]] = {
 
 DEFAULT_STRONGEST_OPENAI_MODEL: str = "gpt-5.5"
 DEFAULT_STRONGEST_ANTHROPIC_MODEL: str = "claude-opus-4-8"
-DEFAULT_STRONGEST_VLLM_MODEL: str = "qwen3.5-27b"
+DEFAULT_STRONGEST_VLLM_MODEL: str = "qwen3.6-27b"
 
 
 def _strongest_model_for_provider(
