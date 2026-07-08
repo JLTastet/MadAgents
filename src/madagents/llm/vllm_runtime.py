@@ -86,27 +86,52 @@ def _thinking_family(model_name: str) -> str | None:
     return None
 
 
+def _get_effective_extra_body(llm: Any) -> dict[str, Any]:
+    """Return the ``extra_body`` in effect for ``llm``'s next request.
+
+    The outermost RunnableBinding layer carrying one wins (``.bind()``
+    flattens chained binds into it; the walk handles manually-nested
+    bindings), falling back to the constructor field, then ``{}``.
+    """
+    base = llm
+    while hasattr(base, "bound") and base.bound is not None:
+        base = base.bound
+    cur = llm
+    while cur is not None and cur is not base:
+        kw = getattr(cur, "kwargs", None)
+        if isinstance(kw, dict) and isinstance(kw.get("extra_body"), dict):
+            return kw["extra_body"]
+        cur = getattr(cur, "bound", None)
+    candidate = getattr(base, "extra_body", None)
+    return candidate if isinstance(candidate, dict) else {}
+
+
+def _bind_extra_body(llm: Any, updates: dict[str, Any]) -> Any:
+    """Bind ``extra_body`` merged over what's already in effect on ``llm``.
+
+    ``.bind(extra_body=...)`` replaces wholesale, which would drop
+    constructor sampling params; ``chat_template_kwargs`` merges one level
+    deep so template flags from different bind sites compose.
+    """
+    current = _get_effective_extra_body(llm)
+    merged = {**current, **updates}
+    cur_ctk = current.get("chat_template_kwargs")
+    new_ctk = updates.get("chat_template_kwargs")
+    if isinstance(cur_ctk, dict) and isinstance(new_ctk, dict):
+        merged["chat_template_kwargs"] = {**cur_ctk, **new_ctk}
+    return llm.bind(extra_body=merged)
+
+
 def _extract_sampling_params(llm: Any) -> dict[str, Any]:
     """Return sampling params reflecting what's actually bound for the call.
 
     Reads native ChatOpenAI Pydantic fields (``temperature``, ``top_p``,
-    ``seed``) which serialise at OpenAI request top-level, and the outermost
-    ``RunnableBinding.kwargs.extra_body`` (``top_k``, ``min_p``) which is
-    what's on the wire after any ``.bind(extra_body=...)`` override. Returns
-    only the keys that are present and non-None — callers should treat
-    absence as "not bound at this level".
+    ``seed``) which serialise at OpenAI request top-level, and the effective
+    ``extra_body`` (``top_k``, ``min_p``) which is what's on the wire after
+    any ``.bind(extra_body=...)`` override. Returns only the keys that are
+    present and non-None — callers should treat absence as "not bound at
+    this level".
     """
-    # FIXME: on reasoning-enabled calls, ``top_k`` and ``min_p`` are absent
-    # from the returned dict because ``bind_reasoning`` wholly replaces the
-    # constructor's ``extra_body`` with one that only carries
-    # ``chat_template_kwargs`` (RunnableBinding does flat top-level kwarg
-    # replacement, not deep-merge). The values returned here are wire-
-    # faithful — they reflect what the audit script will see — but the wire
-    # itself is wrong: dropping ``top_k=20`` materially affects sampling
-    # diversity on Qwen3.5 reasoning turns. The right fix is to make
-    # ``bind_reasoning`` deep-merge ``extra_body`` so ``top_k``/``min_p``
-    # survive; once that lands, this helper can read the outer binding's
-    # extra_body literally without the chain-walk fallback below.
     base = llm
     while hasattr(base, "bound") and base.bound is not None:
         base = base.bound
@@ -117,29 +142,10 @@ def _extract_sampling_params(llm: Any) -> dict[str, Any]:
         if v is not None:
             out[native] = v
 
-    # Find the FIRST (outermost) RunnableBinding layer whose kwargs carry an
-    # extra_body, walking down toward base. RunnableBinding.bind() flattens
-    # chained .bind() calls into the outer layer's kwargs (later .bind() wins
-    # via {**self.kwargs, **kw} merge), so for any chain produced by .bind()
-    # this loop hits on the first iteration. Walking handles the manually-
-    # nested case (RunnableBinding(bound=RunnableBinding(bound=chat))) where
-    # the inner layer might carry the extra_body the outer didn't override.
-    extra_body: dict[str, Any] | None = None
-    cur = llm
-    while cur is not None and cur is not base:
-        kw = getattr(cur, "kwargs", None)
-        if isinstance(kw, dict) and isinstance(kw.get("extra_body"), dict):
-            extra_body = kw["extra_body"]
-            break
-        cur = getattr(cur, "bound", None)
-    if extra_body is None:
-        candidate = getattr(base, "extra_body", None)
-        if isinstance(candidate, dict):
-            extra_body = candidate
-    if extra_body:
-        for key in ("top_k", "min_p"):
-            if extra_body.get(key) is not None:
-                out[key] = extra_body[key]
+    extra_body = _get_effective_extra_body(llm)
+    for key in ("top_k", "min_p"):
+        if extra_body.get(key) is not None:
+            out[key] = extra_body[key]
     return out
 
 
@@ -351,14 +357,9 @@ class VLLMRuntime(LLMRuntime):
 
         _reject_unsupported_caller_max_tokens(max_tokens)
 
-        # Seed reproducibility for per-trial replay. Read MADAGENTS_VLLM_SEED
-        # from env and pass via the native ChatOpenAI Pydantic ``seed`` field —
-        # NOT via ``extra_body``. ``bind_reasoning`` calls
-        # ``llm.bind(extra_body={"chat_template_kwargs": ...})``, and
-        # RunnableBinding does flat top-level kwarg replacement (not deep
-        # merge), so anything we put in extra_body here would be silently
-        # dropped on every reasoning-enabled call. The native ``seed`` field
-        # lives on the inner Pydantic instance and survives all .bind() calls.
+        # Seed reproducibility for per-trial replay, via the native ChatOpenAI
+        # Pydantic ``seed`` field: it lives on the inner Pydantic instance and
+        # survives all .bind() calls, independent of extra_body merging.
         seed: int | None = None
         seed_env = os.environ.get("MADAGENTS_VLLM_SEED")
         if seed_env:
@@ -406,7 +407,9 @@ class VLLMRuntime(LLMRuntime):
         family = _thinking_family(_get_model_name(llm))
         if not effort or family is None:
             return llm  # No applicable thinking control — use model default.
-        return llm.bind(extra_body=_THINKING_CONTROL[family][effort])
+        # The merge keeps sampling params and the preserve_thinking kwarg
+        # bound by bind_reasoning_trace (applied first at every call site).
+        return _bind_extra_body(llm, _THINKING_CONTROL[family][effort])
 
     def bind_reasoning_trace(self, llm: Any) -> Any:
         return llm  # No-op — encrypted reasoning traces are OpenAI-specific
