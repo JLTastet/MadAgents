@@ -42,6 +42,9 @@ export const SUPPORTED_MODELS = [
   "gpt-5.1",
   "gpt-5.2",
   "gpt-5.4",
+  "gpt-5.5",
+  "claude-opus-4-8",
+  "claude-opus-4-7",
   "claude-opus-4-6",
   "claude-sonnet-4-6",
   "claude-haiku-4-5",
@@ -132,11 +135,14 @@ export function groupModelsByProvider(models) {
  * Model capability tiers — mirrors config.py OPENAI_MODEL_TIERS / ANTHROPIC_MODEL_TIERS.
  */
 const MODEL_TIERS = {
+  "gpt-5.5": "strongest",
   "gpt-5.4": "strongest",
   "gpt-5.2": "strongest",
   "gpt-5.1": "strongest",
   "gpt-5-mini": "mid-tier",
   "gpt-5-nano": "lightest",
+  "claude-opus-4-8": "strongest",
+  "claude-opus-4-7": "strongest",
   "claude-opus-4-6": "strongest",
   "claude-sonnet-4-6": "mid-tier",
   "claude-haiku-4-5": "lightest",
@@ -168,13 +174,13 @@ export function modelsForRouting(providerModels, strongestModel) {
 export function strongestModelForProvider(orchestratorModel, provider) {
   const tier = MODEL_TIERS[orchestratorModel] || "unknown";
   if (tier === "strongest") return orchestratorModel;
-  if (provider === "anthropic") return "claude-opus-4-6";
+  if (provider === "anthropic") return "claude-opus-4-8";
   if (provider === "vllm") return "qwen3.5-27b";
-  return "gpt-5.2";
+  return "gpt-5.5";
 }
 
 export const VERBOSITY_LEVELS = ["low", "medium", "high"];
-export const REASONING_EFFORT_LEVELS = ["minimal", "low", "medium", "high"];
+export const REASONING_EFFORT_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"];
 
 export const REVIEWER_AGENTS = [
   "plan_reviewer",
