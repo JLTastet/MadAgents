@@ -1,0 +1,17 @@
+# Optional dependencies for the locally-executed tool variants used by the
+# vLLM runtime (see prepare_tools in madagents/llm/vllm_runtime.py). Not part
+# of requirements-agent.txt: install into the writable overlay instead of the
+# image so builds don't grow for deployments that never serve local models.
+#
+# IMPORTANT: install the CPU torch build FIRST, or pip resolves the default
+# CUDA build (several GB larger and useless here — conversions are forced to
+# CPU):
+#   python3 -m pip install --break-system-packages --no-cache-dir \
+#     torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#   python3 -m pip install --break-system-packages --no-cache-dir \
+#     -r requirements-local-tools.txt
+#
+# docling also needs its model weights downloaded once (default location
+# expected by madrun_api.sh: /opt/docling-models):
+#   docling-tools models download -o /opt/docling-models
+docling==2.110.0

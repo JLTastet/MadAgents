@@ -1,7 +1,12 @@
+import hashlib
+import json
+import logging
 import os
 import subprocess
 import threading
 import time
+import urllib.parse
+import urllib.request
 
 from pathlib import Path
 from typing import Tuple, Union, Optional, Dict, List, Literal, Any
@@ -31,12 +36,78 @@ from madagents.bash_helpers import (
 
 from madagents.patch_helpers import apply_patch_operation_to_fs
 
+logger = logging.getLogger(__name__)
+
 #########################################################################
 ## web_search ###########################################################
 #########################################################################
 
 web_search_tool = {"type": "web_search"}
 anthropic_web_search_tool = {"type": "web_search_20250305", "name": "web_search"}
+
+SEARXNG_DEFAULT_URL = "http://localhost:8188"
+WEB_SEARCH_TIMEOUT_S = 20.0
+
+def _searxng_url() -> str:
+    """Resolve the SearXNG base URL, treating an empty env value as unset."""
+    return os.environ.get("MADAGENTS_SEARXNG_URL", "").strip() or SEARXNG_DEFAULT_URL
+
+def web_search_local(query: str, max_results: int = 5) -> str:
+    """Query a local SearXNG instance and format the results as text.
+
+    Never raises: on any failure the model gets a short message telling it to
+    proceed without web results, and the actual cause is logged for the user.
+    """
+    base_url = _searxng_url()
+    request_url = f"{base_url}/search?" + urllib.parse.urlencode(
+        {"q": query, "format": "json"}
+    )
+    try:
+        with urllib.request.urlopen(request_url, timeout=WEB_SEARCH_TIMEOUT_S) as response:
+            payload = json.load(response)
+    except (OSError, ValueError) as exc:
+        logger.error("SearXNG request to %s failed: %s", base_url, exc)
+        return "Web search is temporarily unavailable. Proceed without web results."
+
+    results = payload.get("results", [])
+    if not results:
+        unresponsive = payload.get("unresponsive_engines", [])
+        if unresponsive:
+            engines = ", ".join(" ".join(str(part) for part in entry) for entry in unresponsive)
+            logger.warning("SearXNG returned no results; unresponsive engines: %s", engines)
+            return (
+                f'Web search returned no results for "{query}" '
+                f"(some search engines were unresponsive: {engines}). "
+                "Proceed without web results or retry later."
+            )
+        return f'Web search returned no results for "{query}".'
+
+    shown = results[:max_results]
+    lines = [f'Web search results for "{query}" (showing {len(shown)} of {len(results)}):', ""]
+    for i, result in enumerate(shown, start=1):
+        lines.append(f"{i}. {result.get('title', '(no title)')}")
+        lines.append(f"   {result.get('url', '(no URL)')}")
+        snippet = (result.get("content") or "").strip()
+        if snippet:
+            lines.append(f"   {snippet}")
+    return "\n".join(lines)
+
+class WebSearchArgs(BaseModel):
+    query: str = Field(..., description="Search query.")
+    max_results: int = Field(5, ge=1, description="Maximum number of results to return.")
+
+local_web_search_tool = StructuredTool.from_function(
+    name="web_search",
+    description=(
+        "Search the web and return the most relevant results as text "
+        "(title, URL, and snippet for each). "
+        "If the search service is unavailable, returns an informative message instead."
+    ),
+    func=web_search_local,
+    args_schema=WebSearchArgs,
+    return_direct=False,
+    response_format="content"
+)
 
 #########################################################################
 ## bash #################################################################
@@ -356,7 +427,7 @@ apply_patch_tool = StructuredTool.from_function(
 
 def read_pdf(pdf_file_path: str) -> Tuple[Union[list[dict], str], str]:
     """Validate and load a PDF file as a content block."""
-    if not pdf_file_path.endswith(".pdf"):
+    if not pdf_file_path.lower().endswith(".pdf"):
         error_msg = f"Error: The file {pdf_file_path} does not end with .pdf"
         return error_msg, error_msg
     if not os.path.exists(pdf_file_path):
@@ -383,7 +454,7 @@ openai_read_pdf_tool = StructuredTool.from_function(
 
 def read_pdf_anthropic(pdf_file_path: str) -> Tuple[Union[list[dict], str], str]:
     """Validate and load a PDF file as an Anthropic document content block."""
-    if not pdf_file_path.endswith(".pdf"):
+    if not pdf_file_path.lower().endswith(".pdf"):
         error_msg = f"Error: The file {pdf_file_path} does not end with .pdf"
         return error_msg, error_msg
     if not os.path.exists(pdf_file_path):
@@ -400,6 +471,118 @@ anthropic_read_pdf_tool = StructuredTool.from_function(
         "On failure, returns an error message."
     ),
     func=read_pdf_anthropic,
+    args_schema=ReadPDFArgs,
+    return_direct=False,
+    response_format="content_and_artifact"
+)
+
+READ_PDF_MAX_CHARS_DEFAULT = 60_000
+
+_docling_converter = None
+_docling_lock = threading.Lock()
+
+def _read_pdf_max_chars() -> int:
+    """Resolve the markdown length cap, treating an empty env value as unset."""
+    raw = os.environ.get("MADAGENTS_READ_PDF_MAX_CHARS", "").strip()
+    if not raw:
+        return READ_PDF_MAX_CHARS_DEFAULT
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid MADAGENTS_READ_PDF_MAX_CHARS value %r; using default %d",
+            raw, READ_PDF_MAX_CHARS_DEFAULT,
+        )
+        return READ_PDF_MAX_CHARS_DEFAULT
+
+def _build_docling_converter():
+    """Build a CPU-only docling PDF converter.
+
+    docling is imported lazily: it is an optional dependency, only needed on
+    runtimes without native PDF support. The device is forced to CPU so the
+    converter never claims a GPU. Formula enrichment (LaTeX reconstruction of
+    display equations, roughly 35x slower) is enabled by setting
+    MADAGENTS_DOCLING_FORMULA_ENRICHMENT to a non-empty value. Model weights
+    are resolved by docling itself via the DOCLING_ARTIFACTS_PATH env var.
+    """
+    from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import PdfPipelineOptions
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+
+    pipeline_options = PdfPipelineOptions(
+        do_formula_enrichment=bool(os.environ.get("MADAGENTS_DOCLING_FORMULA_ENRICHMENT", "").strip()),
+        accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CPU),
+    )
+    return DocumentConverter(
+        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
+    )
+
+def read_pdf_local(pdf_file_path: str) -> Tuple[str, str]:
+    """Convert a PDF to markdown text locally with docling.
+
+    Used on runtimes whose models cannot consume PDF content blocks natively.
+    Never raises: any failure is returned as an error-message pair.
+    """
+    if not pdf_file_path.lower().endswith(".pdf"):
+        error_msg = f"Error: The file {pdf_file_path} does not end with .pdf"
+        return error_msg, error_msg
+    if not os.path.exists(pdf_file_path):
+        error_msg = f"Error: The file {pdf_file_path} was not found."
+        return error_msg, error_msg
+
+    global _docling_converter
+    try:
+        # The lock also serializes conversions: each one can peak at a few GB
+        # of RSS, so concurrent read_pdf calls queue instead of multiplying
+        # memory.
+        with _docling_lock:
+            if _docling_converter is None:
+                _docling_converter = _build_docling_converter()
+            result = _docling_converter.convert(pdf_file_path)
+        markdown = result.document.export_to_markdown()
+    except ImportError as exc:
+        logger.error("read_pdf is unavailable (docling import failed): %s", exc)
+        error_msg = "Error: PDF reading is unavailable on this runtime."
+        return error_msg, error_msg
+    except Exception as exc:
+        logger.exception("docling failed to convert %s", pdf_file_path)
+        error_msg = f"Error: Could not convert {pdf_file_path} to markdown: {exc}"
+        return error_msg, error_msg
+
+    total_chars = len(markdown)
+    max_chars = _read_pdf_max_chars()
+    if total_chars <= max_chars:
+        return markdown, f"File {pdf_file_path} converted to markdown ({total_chars} characters)."
+
+    stem = Path(pdf_file_path).stem
+    path_hash = hashlib.md5(pdf_file_path.encode("utf-8")).hexdigest()[:8]
+    full_text_path = os.path.join(get_log_root(), f"read_pdf_{stem}_{path_hash}.md")
+    try:
+        with open(full_text_path, "w", encoding="utf-8") as file_handle:
+            file_handle.write(markdown)
+    except OSError as exc:
+        logger.warning("Could not save full read_pdf markdown to %s: %s", full_text_path, exc)
+        full_text_path = None
+    notice = f"\n\n[truncated: showing {max_chars} of {total_chars} characters"
+    if full_text_path:
+        notice += f"; full text at {full_text_path}"
+    notice += "]"
+    return (
+        markdown[:max_chars] + notice,
+        f"File {pdf_file_path} converted to markdown ({total_chars} characters, truncated to {max_chars}).",
+    )
+
+local_read_pdf_tool = StructuredTool.from_function(
+    name="read_pdf",
+    description=(
+        "Makes the PDF content available in the conversation as markdown text. "
+        "Path must be absolute, must exist, and must end with .pdf. "
+        "Very long documents are truncated; the full text is then saved to a file "
+        "whose path is given in the output. "
+        "On failure, returns an error message."
+    ),
+    func=read_pdf_local,
     args_schema=ReadPDFArgs,
     return_direct=False,
     response_format="content_and_artifact"
