@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import functools
+import json
 import logging
 import os
 import time
+import urllib.error
+import urllib.request
 from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
@@ -69,18 +73,51 @@ def _resolve_vllm_model() -> str:
     return model
 
 
-def _get_sampling_defaults(model_name: str) -> dict[str, float]:
-    """Look up sampling preset by model-family prefix."""
-    lower = model_name.lower()
+@functools.lru_cache(maxsize=8)
+def _resolve_base_model_name(served_name: str, base_url: str) -> str:
+    """Resolve a served name to its base model's name via ``/v1/models``.
+
+    The base name is the ``parent`` field of a LoRA adapter's model card, or
+    the served name itself for base models. Failure is a hard error: guessing
+    a family from an arbitrary adapter name silently picks wrong defaults.
+    """
+    req = urllib.request.Request(
+        f"{base_url}/models",
+        headers={"Authorization": f"Bearer {os.environ.get('VLLM_API_KEY', 'dummy')}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            cards = json.load(resp).get("data", [])
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Cannot resolve the model family of {served_name!r}: "
+            f"GET {base_url}/models failed ({exc}). The vLLM server must be "
+            f"reachable when the runtime starts."
+        ) from exc
+    for card in cards:
+        if card.get("id") == served_name:
+            return card.get("parent") or served_name
+    raise RuntimeError(
+        f"VLLM_MODEL={served_name!r} is not served at {base_url} "
+        f"(available: {[c.get('id') for c in cards]}). It must exactly match "
+        f"a served model or loaded adapter name."
+    )
+
+
+def _get_sampling_defaults(base_name: str) -> dict[str, float]:
+    """Look up the sampling preset by prefix of the base name (resolve
+    adapter names via ``_resolve_base_model_name`` first)."""
+    lower = base_name.lower()
     for prefix, preset in _SAMPLING_PRESETS.items():
         if prefix != "default" and lower.startswith(prefix):
             return preset
     return _SAMPLING_PRESETS["default"]
 
 
-def _thinking_family(model_name: str) -> str | None:
-    """Return the ``_THINKING_CONTROL`` key matching ``model_name``'s prefix, or None."""
-    lower = model_name.lower()
+def _thinking_family(base_name: str) -> str | None:
+    """Return the ``_THINKING_CONTROL`` key by prefix of the base name (same
+    contract as ``_get_sampling_defaults``)."""
+    lower = base_name.lower()
     for prefix in _THINKING_CONTROL:
         if lower.startswith(prefix):
             return prefix
@@ -366,7 +403,7 @@ class VLLMRuntime(LLMRuntime):
     ) -> ChatOpenAI:
         vllm_model = _resolve_vllm_model()
         vllm_url = _resolve_vllm_url()
-        sampling = _get_sampling_defaults(vllm_model)
+        sampling = _get_sampling_defaults(_resolve_base_model_name(vllm_model, vllm_url))
 
         _reject_unsupported_caller_max_tokens(max_tokens)
 
@@ -428,7 +465,9 @@ class VLLMRuntime(LLMRuntime):
         adaptive: bool = True,  # Unused; Anthropic-only adaptive-thinking hint.
     ) -> Any:
         effort = (reasoning_effort or "").strip().lower() or None
-        family = _thinking_family(_get_model_name(llm))
+        family = _thinking_family(
+            _resolve_base_model_name(_get_model_name(llm), _resolve_vllm_url()),
+        )
         if not effort or family is None:
             return llm  # No applicable thinking control — use model default.
         # The merge keeps sampling params and the preserve_thinking kwarg
