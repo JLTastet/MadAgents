@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 import contextvars
+import logging
 import os
 from typing import Optional
 import re
@@ -15,6 +16,47 @@ from madagents.cli_bridge.bridge_handle import (
     start_bridge,
     stop_bridge,
 )
+
+logger = logging.getLogger(__name__)
+
+# Inline cap for CLI output returned to the model; mirrors the bash tool's
+# SPILL_INLINE_CHAR_LIMIT (not imported to avoid a circular import). The full
+# output always remains in the on-disk transcript.
+CLI_INLINE_MAX_CHARS_DEFAULT = 20_000
+
+def _cli_inline_max_chars() -> int:
+    """Resolve the CLI inline cap; 0 disables it, an empty env value is unset."""
+    raw = os.environ.get("MADAGENTS_CLI_INLINE_MAX_CHARS", "").strip()
+    if not raw:
+        return CLI_INLINE_MAX_CHARS_DEFAULT
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid MADAGENTS_CLI_INLINE_MAX_CHARS value %r; using default %d",
+            raw, CLI_INLINE_MAX_CHARS_DEFAULT,
+        )
+        return CLI_INLINE_MAX_CHARS_DEFAULT
+
+def cap_inline_output(text: str) -> str:
+    """Truncate CLI output for inline use, keeping the most recent part.
+
+    The dropped head stays available in the transcript; the marker tells the
+    model how to page through it.
+    """
+    max_chars = _cli_inline_max_chars()
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    # Line counts guide the paging tool, which takes line ranges, not chars.
+    dropped = len(text) - max_chars
+    dropped_lines = text[:dropped].count("\n")
+    total_lines = text.count("\n") + 1
+    return (
+        f"[... truncated: dropped the first {dropped} of {len(text)} chars "
+        f"(~{dropped_lines} of {total_lines} lines); the full output is in the "
+        f"CLI transcript, readable in slices with "
+        f"read_int_cli_transcript(start_line, end_line)]\n" + text[-max_chars:]
+    )
 
 # Context variable used by CLISessionManager to route calls to the correct
 # per-instance CLISession.  Worker executor nodes set this before invoking
@@ -69,7 +111,7 @@ class CLISession:
             self.read_offset = new_offset
             cli_chunk = chunk.decode("utf-8", errors="ignore") if chunk else ""
             cli_chunk = strip_control_codes(cli_chunk)
-            return cli_chunk
+            return cap_inline_output(cli_chunk)
 
         except TimeoutError as exc:
             traceback.print_exc()
@@ -176,7 +218,7 @@ class CLISession:
 
         selected = b"".join(lines[start_line - 1:end_line])
         text = strip_control_codes(selected.decode("utf-8", errors="replace"))
-        return text, start_line, end_line
+        return cap_inline_output(text), start_line, end_line
 
 
 class CLISessionManager:

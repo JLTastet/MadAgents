@@ -99,6 +99,12 @@ class MadAgents:
             token_threshold=summarizer_cfg.token_threshold or 150_000,
             keep_last_messages=summarizer_cfg.keep_last_messages or 10,
             min_tail_tokens=summarizer_cfg.min_tail_tokens or 10_000,
+            max_tail_tokens=summarizer_cfg.max_tail_tokens or 20_000,
+            elide_before_summary=(
+                summarizer_cfg.elide_before_summary
+                if summarizer_cfg.elide_before_summary is not None
+                else True
+            ),
             runtime=summarizer_runtime,
         )
 

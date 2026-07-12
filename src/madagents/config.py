@@ -165,6 +165,8 @@ class AgentConfig(BaseModel):
     token_threshold: Optional[int] = Field(default=None)
     keep_last_messages: Optional[int] = Field(default=None)
     min_tail_tokens: Optional[int] = Field(default=None)
+    max_tail_tokens: Optional[int] = Field(default=None)
+    elide_before_summary: Optional[bool] = Field(default=None)
     step_limit: Optional[int] = Field(default=None)
     supports_step_limit: bool = Field(default=True)
 
@@ -215,7 +217,7 @@ class AgentConfig(BaseModel):
             raise ValueError(f"Unsupported reasoning effort: {value}")
         return value
 
-    @field_validator("token_threshold", "keep_last_messages", "min_tail_tokens")
+    @field_validator("token_threshold", "keep_last_messages", "min_tail_tokens", "max_tail_tokens")
     @classmethod
     def _validate_positive_int(cls, value: Optional[int]) -> Optional[int]:
         """Validate optional positive integer fields."""
@@ -276,6 +278,8 @@ def _default_agents() -> Dict[str, AgentConfig]:
             token_threshold=DEFAULT_SUMMARIZER_TOKEN_THRESHOLD,
             keep_last_messages=10,
             min_tail_tokens=10_000,
+            max_tail_tokens=20_000,
+            elide_before_summary=True,
         ),
     }
     for reviewer in REVIEWER_AGENTS:
@@ -378,6 +382,8 @@ def coerce_config(payload: Optional[dict]) -> MadAgentsConfig:
                 "token_threshold",
                 "keep_last_messages",
                 "min_tail_tokens",
+                "max_tail_tokens",
+                "elide_before_summary",
             ):
                 if key in agent_payload:
                     data["agents"][name][key] = agent_payload.get(key)

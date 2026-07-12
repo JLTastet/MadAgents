@@ -14,7 +14,7 @@ from typing import Tuple, Union, Optional, Dict, List, Literal, Any
 from pydantic import BaseModel, Field
 from langchain_core.tools import StructuredTool
 
-from madagents.cli_bridge.bridge_interface import CLISession, strip_control_codes
+from madagents.cli_bridge.bridge_interface import CLISession, cap_inline_output, strip_control_codes
 
 from madagents.utils import (
     pdf_to_content_block,
@@ -47,10 +47,27 @@ anthropic_web_search_tool = {"type": "web_search_20250305", "name": "web_search"
 
 SEARXNG_DEFAULT_URL = "http://localhost:8188"
 WEB_SEARCH_TIMEOUT_S = 20.0
+# Sized from the Anthropic web_search server tool on Opus 4.8 (fixed 10 results
+# per call, ~2.5-3.2K chars of context weight each) plus safety margin.
+WEB_SEARCH_SNIPPET_MAX_CHARS_DEFAULT = 5_000
 
 def _searxng_url() -> str:
     """Resolve the SearXNG base URL, treating an empty env value as unset."""
     return os.environ.get("MADAGENTS_SEARXNG_URL", "").strip() or SEARXNG_DEFAULT_URL
+
+def _web_search_snippet_max_chars() -> int:
+    """Resolve the per-snippet cap; 0 disables it, an empty env value is unset."""
+    raw = os.environ.get("MADAGENTS_WEB_SEARCH_SNIPPET_MAX_CHARS", "").strip()
+    if not raw:
+        return WEB_SEARCH_SNIPPET_MAX_CHARS_DEFAULT
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid MADAGENTS_WEB_SEARCH_SNIPPET_MAX_CHARS value %r; using default %d",
+            raw, WEB_SEARCH_SNIPPET_MAX_CHARS_DEFAULT,
+        )
+        return WEB_SEARCH_SNIPPET_MAX_CHARS_DEFAULT
 
 def web_search_local(query: str, max_results: int = 5) -> str:
     """Query a local SearXNG instance and format the results as text.
@@ -83,18 +100,24 @@ def web_search_local(query: str, max_results: int = 5) -> str:
         return f'Web search returned no results for "{query}".'
 
     shown = results[:max_results]
+    snippet_max_chars = _web_search_snippet_max_chars()
     lines = [f'Web search results for "{query}" (showing {len(shown)} of {len(results)}):', ""]
     for i, result in enumerate(shown, start=1):
         lines.append(f"{i}. {result.get('title', '(no title)')}")
         lines.append(f"   {result.get('url', '(no URL)')}")
         snippet = (result.get("content") or "").strip()
+        if 0 < snippet_max_chars < len(snippet):
+            snippet = (
+                snippet[:snippet_max_chars]
+                + f" [... snippet truncated: showing {snippet_max_chars} of {len(snippet)} chars]"
+            )
         if snippet:
             lines.append(f"   {snippet}")
     return "\n".join(lines)
 
 class WebSearchArgs(BaseModel):
     query: str = Field(..., description="Search query.")
-    max_results: int = Field(5, ge=1, description="Maximum number of results to return.")
+    max_results: int = Field(5, ge=1, le=10, description="Maximum number of results to return (at most 10).")
 
 local_web_search_tool = StructuredTool.from_function(
     name="web_search",
@@ -692,7 +715,7 @@ def get_int_cli_status(session: CLISession):
         new_bytes = data[previous_offset:file_len] if file_len > previous_offset else b""
         session.read_offset = file_len
         prefix = data[:session.read_offset]
-        new_output = strip_control_codes(new_bytes.decode("utf-8", errors="replace"))
+        new_output = cap_inline_output(strip_control_codes(new_bytes.decode("utf-8", errors="replace")))
 
         total_lines = _count_lines(data)
         lines_before = _count_lines(prefix)
@@ -708,7 +731,8 @@ def get_int_cli_status(session: CLISession):
             for line in context_lines:
                 text = strip_control_codes(line.decode("utf-8", errors="replace")).rstrip("\r")
                 rendered.append(text)
-            context_text = "\n".join(rendered)
+            # Line count is bounded above, but line width is not.
+            context_text = cap_inline_output("\n".join(rendered))
 
         msg_lines = [
             f"{status} ({lines_before} lines before read position, {lines_after} lines after read position)"

@@ -7,6 +7,7 @@ import re
 
 from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, ToolMessage
 
+from madagents.bash_helpers import _reserve_nonexistent_path
 from madagents.llm import LLMRuntime, get_default_runtime
 from madagents.utils import response_to_text
 
@@ -70,12 +71,16 @@ class Summarizer:
         token_threshold: int = 150_000,
         keep_last_messages: int = 10,
         min_tail_tokens: int = 10_000,
+        max_tail_tokens: int = 20_000,
+        elide_before_summary: bool = True,
         runtime: LLMRuntime | None = None,
     ):
         """Initialize the summarizer LLM and token-budget parameters."""
         self.token_threshold = token_threshold
         self.keep_last_messages = keep_last_messages
         self.min_tail_tokens = min_tail_tokens
+        self.max_tail_tokens = max_tail_tokens
+        self.elide_before_summary = elide_before_summary
         self.runtime = runtime or get_default_runtime()
         self.llm = self.runtime.create_chat_model(
             model=model,
@@ -115,8 +120,20 @@ class Summarizer:
         token_threshold: int | None = None,
         keep_last_messages: int | None = None,
         min_tail_tokens: int | None = None,
+        max_tail_tokens: int | None = None,
+        elide_before_summary: bool | None = None,
     ) -> Tuple[str | None, int]:
-        """Summarize older messages if the token budget is exceeded."""
+        """Summarize older messages if the token budget is exceeded.
+
+        May also elide oversized tool results in place (the message objects are
+        mutated, so the elision persists wherever they are shared); see
+        ``_elide_oversized_tool_results``.
+
+        Token budgets: ``token_threshold`` gates on the full prompt (exact where
+        the runtime can count); ``min_tail_tokens`` / ``max_tail_tokens`` bound
+        the preserved tail (char heuristic), with ``max_tail_tokens`` clamped so
+        summarization keeps a real margin under the threshold.
+        """
         token_threshold = (
             token_threshold if isinstance(token_threshold, int) else self.token_threshold
         )
@@ -126,34 +143,73 @@ class Summarizer:
         min_tail_tokens = (
             min_tail_tokens if isinstance(min_tail_tokens, int) else self.min_tail_tokens
         )
+        max_tail_tokens = (
+            max_tail_tokens if isinstance(max_tail_tokens, int) else self.max_tail_tokens
+        )
+        # Keep a real summarization margin even on small context windows; clamp
+        # min_tail_tokens too, else phase 2.5 re-expands the tail past the cap.
+        max_tail_tokens = min(max_tail_tokens, token_threshold // 2)
+        min_tail_tokens = min(min_tail_tokens, max_tail_tokens)
+        elide_before_summary = (
+            elide_before_summary
+            if isinstance(elide_before_summary, bool)
+            else self.elide_before_summary
+        )
         # Short-circuit if still under budget. token_threshold is a full-prompt
         # budget, so the gate measures the full prompt (see _prompt_tokens).
-        if self._prompt_tokens(messages[prev_non_summary_start:]) <= token_threshold:
+        prompt_tokens = self._prompt_tokens(messages[prev_non_summary_start:])
+        if prompt_tokens <= token_threshold:
             return prev_summary, prev_non_summary_start
+
+        if elide_before_summary:
+            # Elide oversized old tool results first; skip the LLM summary when
+            # the freed estimate suffices. The estimate stays heuristic (the
+            # stale anchor rules out an exact recount) and can err either way;
+            # the invoke-side backstop catches a marginal overshoot.
+            freed = _elide_oversized_tool_results(messages, start=prev_non_summary_start)
+            if freed and prompt_tokens - freed // 4 <= token_threshold:
+                return prev_summary, prev_non_summary_start
 
         new_non_summary_start = _safe_tail_start_index(
             messages,
             min_start=prev_non_summary_start,
             keep_last_non_tool=keep_last_messages,
             min_tail_tokens=min_tail_tokens,
+            max_tail_tokens=max_tail_tokens,
         )
 
         # The gate fired, but the preserved tail (keep_last_messages /
         # min_tail_tokens / tool-pair adjacency) already reaches the boundary, so
-        # the prompt cannot be shrunk. This is usually caused by a single oversized
-        # tool result. The runtime's dynamic-max cap is the backstop against actual
-        # context overflow.
+        # no messages can be summarized away. Elide oversized tool results in the
+        # tail instead; if even that leaves it over budget (e.g. oversized non-tool
+        # content), the runtime's dynamic-max cap is the backstop against overflow.
         if new_non_summary_start <= prev_non_summary_start:
-            logger.warning(
-                "summarizer: the prompt is over token_threshold=%d but cannot be "
-                "shrunk; the preserved tail already starts at index %d (likely a "
-                "large recent tool result). The prompt may approach the context limit.",
-                token_threshold, prev_non_summary_start,
+            _elide_oversized_tool_results(
+                messages, start=prev_non_summary_start, token_budget=max_tail_tokens
             )
+            # Heuristic check only: the tail's anchor still carries its
+            # pre-elision usage_metadata, so an exact recount would misreport.
+            if approx_tokens_in_messages(messages[prev_non_summary_start:]) > token_threshold:
+                logger.warning(
+                    "summarizer: the prompt is over token_threshold=%d and cannot be "
+                    "shrunk; the preserved tail already starts at index %d and is "
+                    "still over budget after eliding its oversized tool results. "
+                    "The prompt may approach the context limit.",
+                    token_threshold, prev_non_summary_start,
+                )
+            else:
+                logger.info(
+                    "summarizer: boundary pinned at index %d; elided oversized tool "
+                    "results in place to fit the budget.",
+                    prev_non_summary_start,
+                )
             return prev_summary, prev_non_summary_start
 
         to_summarize = messages[prev_non_summary_start:new_non_summary_start]
         new_summary = self._summarize(prev_summary, to_summarize)
+        _elide_oversized_tool_results(
+            messages, start=new_non_summary_start, token_budget=max_tail_tokens
+        )
         return new_summary, new_non_summary_start
 
     def _prompt_tokens(self, messages: list[BaseMessage]) -> int:
@@ -654,23 +710,33 @@ def _safe_tail_start_index(
     min_start: int,
     keep_last_non_tool: int,
     min_tail_tokens: int = 0,
+    max_tail_tokens: int | None = None,
 ) -> int:
     """
     Returns an index `k` such that:
       - messages[k:] is the kept tail
       - we keep ~keep_last_non_tool non-tool messages
       - we keep expanding the tail until it reaches min_tail_tokens
+      - we stop expanding at ~max_tail_tokens (heuristic count), so a tool-heavy
+        history with few non-tool messages cannot pin the tail at the start; this
+        is a soft cap, since the later phases below may still grow the tail
       - we do not split tool-call <-> tool-result adjacency
     """
     n = len(messages)
     if n <= min_start:
         return n
 
-    # 1) Walk backwards until we kept enough non-tool messages
+    # 1) Walk backwards until we kept enough non-tool messages, or the token
+    # budget is reached. At least one message is always kept.
     kept_non_tool = 0
+    tail_tokens = 0
     k = n
     while k > min_start and kept_non_tool < keep_last_non_tool:
+        next_tokens = approx_tokens_in_messages([messages[k - 1]])
+        if max_tail_tokens is not None and k < n and tail_tokens + next_tokens > max_tail_tokens:
+            break
         k -= 1
+        tail_tokens += next_tokens
         m = messages[k]
         if _is_tool_result(m):
             # tool outputs don't count toward "non-tool messages"
@@ -861,7 +927,158 @@ def _serialize_messages(messages: list[BaseMessage]) -> str:
 ## Observation masking ##################################################
 #########################################################################
 
+# Tool results at or below this size are never elided: the threshold comfortably
+# covers a long path or a typical `head`/`tail` output the agent already trimmed
+# itself (~10 lines x ~120 chars, x2 margin), but not much more.
+ELIDE_THRESHOLD_CHARS = 2_500
+# Lines kept on each side of the elision marker.
+ELIDE_HEAD_LINES = 5
+ELIDE_TAIL_LINES = 5
+# Backstop on the total kept text, for content with very long lines
+# (kept lines x ~100 chars/line x2 margin).
+ELIDE_MAX_KEPT_CHARS = 2_000
 
+# Marker for an already-elided tool result. Detection is anchored to a full
+# marker line so content that merely quotes the marker mid-line (e.g. a dumped
+# JSON log) stays elidable; a verbatim full-line quote still matches.
+_ELIDE_MARKER = "[... elided by summarizer:"
+_ELIDE_MARKER_RE = re.compile(r"^\[\.\.\. elided by summarizer: .*\]$", re.MULTILINE)
+
+# On-disk full-output paths embedded by the source-side truncation markers
+# (the bash tool's spill notices and char cap, and read_pdf's char cap).
+_SOURCE_PATH_RE = re.compile(
+    r"full (?:output|text) at (\S+?)\]"
+    r"|full std(?:out|err) is in: (\S+)"
+)
+
+def _elide_tool_message(msg: ToolMessage) -> int:
+    """Elide ``msg.content`` in place, returning the number of characters freed.
+
+    The replacement keeps the first/last lines around a marker that names the
+    on-disk file holding the full content: an existing source-side spill file if
+    the content references one, else a new file written here. Mutating the shared
+    message object makes the elision stick wherever the message is referenced.
+    """
+    content = msg.content
+    if not isinstance(content, str):
+        logger.debug("summarizer: not eliding a non-string tool result (%s)", type(content))
+        return 0
+    if _ELIDE_MARKER_RE.search(content) or len(content) <= ELIDE_THRESHOLD_CHARS:
+        return 0
+
+    source_match = _SOURCE_PATH_RE.search(content)
+    source_path = source_match.group(1) or source_match.group(2) if source_match else None
+
+    # A source-truncated result inlines only the tail of its output, so take the
+    # head from the on-disk full output when it is readable.
+    head_source = content
+    if source_path is not None:
+        try:
+            with open(source_path, encoding="utf-8", errors="replace") as f:
+                head_source = f.read(ELIDE_MAX_KEPT_CHARS)
+        except OSError as exc:
+            logger.warning(
+                "summarizer: could not read the source spill file %s (%s); keeping "
+                "the head of the inline content instead.", source_path, exc,
+            )
+
+    lines = content.splitlines()
+    if head_source is content and len(lines) <= ELIDE_HEAD_LINES + ELIDE_TAIL_LINES:
+        # Short inline-only content: split it in two instead of duplicating lines.
+        head_lines, tail_lines = lines[:ELIDE_HEAD_LINES], lines[ELIDE_HEAD_LINES:]
+    else:
+        # Head from the true head (on disk when source-truncated), tail inline.
+        head_lines = head_source.splitlines()[:ELIDE_HEAD_LINES]
+        tail_lines = lines[-ELIDE_TAIL_LINES:]
+    # Per-side char cap: the backstop against very long lines.
+    head_full, tail_full = "\n".join(head_lines), "\n".join(tail_lines)
+    head_text = head_full[: ELIDE_MAX_KEPT_CHARS // 2]
+    tail_text = tail_full[-(ELIDE_MAX_KEPT_CHARS // 2):]
+
+    # Skip when eliding would not free a meaningful amount (marker overhead ~160).
+    if len(content) - (len(head_text) + len(tail_text) + 160) < ELIDE_MAX_KEPT_CHARS // 2:
+        return 0
+
+    path = source_path
+    if path is None:
+        try:
+            path = _reserve_nonexistent_path(
+                base=f"elided_{msg.name or 'tool'}_{(msg.tool_call_id or 'x')[:8]}",
+                kind="full",
+            )
+            # errors="replace": a lone surrogate in the content (e.g. from a
+            # malformed JSON escape) must not turn the spill into a crash.
+            with open(path, "w", encoding="utf-8", errors="replace") as f:
+                f.write(content)
+        except (OSError, RuntimeError) as exc:
+            logger.warning(
+                "summarizer: could not save the full tool result before eliding it "
+                "(%s); eliding without a link.", exc,
+            )
+            path = None
+
+    location = f"the full {len(content)}-char output is at {path}" if path else (
+        f"the full {len(content)}-char output was not saved"
+    )
+    # When the char caps cut into the kept lines, count chars, not lines.
+    if len(head_text) + len(tail_text) < len(head_full) + len(tail_full):
+        kept = f"kept {len(head_text) + len(tail_text)} chars from the ends of {len(lines)} lines"
+    else:
+        kept = f"kept the first {len(head_lines)} and last {len(tail_lines)} of {len(lines)} lines"
+    marker = f"{_ELIDE_MARKER} {kept}; {location}]"
+    msg.content = "\n".join(part for part in (head_text, marker, tail_text) if part)
+    # Drop any cached size estimate so heuristic counts see the shrink.
+    msg.additional_kwargs.pop("imputed_token_count", None)
+    return len(content) - len(msg.content)
+
+def _elide_oversized_tool_results(
+    messages: list[BaseMessage],
+    *,
+    start: int,
+    token_budget: int | None = None,
+) -> int:
+    """Elide oversized tool results in ``messages[start:]`` in place, oldest first.
+
+    With ``token_budget=None``, every oversized tool result except the most
+    recent tool round is elided. With an integer budget (heuristic tokens),
+    elision stops as soon as the slice fits the budget, and the most recent
+    round is elided too if sparing it is not enough. Returns the total
+    characters freed.
+    """
+    tail = messages[start:]
+    freed = 0
+
+    # Tool results after the last tool-calling message form the most recent
+    # round. Without any tool-calling message in the slice, fall back to the
+    # trailing run of tool results so the newest observations are still spared.
+    last_call = max(
+        (i for i, m in enumerate(tail) if _has_tool_call(m)), default=None
+    )
+    if last_call is None:
+        last_call = len(tail) - 1
+        while last_call >= 0 and isinstance(tail[last_call], ToolMessage):
+            last_call -= 1
+
+    for i, m in enumerate(tail):
+        # Done as soon as the slice fits the budget (never fires budget-less).
+        if token_budget is not None and approx_tokens_in_messages(tail) <= token_budget:
+            break
+        if not isinstance(m, ToolMessage):
+            continue
+        if i > last_call and token_budget is None:
+            # Budget-less pass: the most recent round is always spared.
+            break
+        freed_now = _elide_tool_message(m)
+        # Past last_call, sparing the most recent round was not enough.
+        if freed_now and i > last_call:
+            logger.warning(
+                "summarizer: elided the most recent tool result (freed %d chars) "
+                "to keep the preserved tail within budget; its elision marker "
+                "names the file holding the full output.", freed_now,
+            )
+        freed += freed_now
+
+    return freed
 
 #########################################################################
 ## Summary tag extraction ###############################################
