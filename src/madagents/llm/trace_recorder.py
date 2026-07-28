@@ -29,7 +29,10 @@ from langchain_openai.chat_models import base as lc_base
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+# Schema changelog:
+# * Version 2 added per-call ``sampled_tokens``: the sampler's own token ids
+#   and logprobs, which training checks its own render against.
+SCHEMA_VERSION = 2
 DEFAULT_LOG_PATH = "/diagnostics/traces.jsonl"
 DROP_STUB_NAME = "trace_recorder_dropped.json"
 
@@ -115,6 +118,21 @@ def _output_message_to_dict(msg: AIMessage) -> dict[str, Any]:
             len(malformed),
         )
     return out
+
+
+def _strip_logprobs(response_metadata: dict | None,
+                    sampled_tokens: dict | None) -> dict[str, Any] | None:
+    """Copy ``response_metadata``, dropping the logprobs stream once it is redundant.
+
+    The compact ``sampled_tokens`` holds everything training needs from that
+    stream, which is far larger. When the compact form is missing the extraction
+    failed, and the raw stream is then the only evidence of why, so it is kept.
+    """
+    if not isinstance(response_metadata, dict):
+        return None
+    if sampled_tokens is None:
+        return dict(response_metadata)
+    return {k: v for k, v in response_metadata.items() if k != "logprobs"}
 
 
 class TraceRecorder:
@@ -243,6 +261,8 @@ class TraceRecorder:
         usage_metadata: dict | None,
         response_metadata: dict | None,
         sampling_params: dict[str, Any],
+        sampled_tokens: dict[str, Any] | None = None,
+        prompt_token_ids: list[int] | None = None,
         dynamic_max_tokens: int,
         duration_ms: int,
         latched_error: str | None,
@@ -267,6 +287,8 @@ class TraceRecorder:
                 usage_metadata=usage_metadata,
                 response_metadata=response_metadata,
                 sampling_params=sampling_params,
+                sampled_tokens=sampled_tokens,
+                prompt_token_ids=prompt_token_ids,
                 dynamic_max_tokens=dynamic_max_tokens,
                 duration_ms=duration_ms,
                 latched_error=latched_error,
@@ -299,6 +321,8 @@ class TraceRecorder:
         usage_metadata: dict | None,
         response_metadata: dict | None,
         sampling_params: dict[str, Any],
+        sampled_tokens: dict[str, Any] | None = None,
+        prompt_token_ids: list[int] | None = None,
         dynamic_max_tokens: int,
         duration_ms: int,
         latched_error: str | None,
@@ -342,8 +366,10 @@ class TraceRecorder:
             "output_message": _output_message_to_dict(output_message),
             "prompt_tokens_vllm": int(prompt_tokens_vllm),
             "usage_metadata": dict(usage_metadata) if isinstance(usage_metadata, dict) else None,
-            "response_metadata": dict(response_metadata) if isinstance(response_metadata, dict) else None,
+            "response_metadata": _strip_logprobs(response_metadata, sampled_tokens),
             "sampling_params": dict(sampling_params or {}),
+            "sampled_tokens": sampled_tokens,
+            "prompt_token_ids": prompt_token_ids,
             "dynamic_max_tokens": int(dynamic_max_tokens),
             "duration_ms": int(duration_ms),
             "latched_error": latched_error,

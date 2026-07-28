@@ -155,13 +155,21 @@ def _tokenize_url() -> str:
     return base + "/tokenize"
 
 
-def _post_tokenize(body: dict[str, Any], *, timeout: float = 60.0) -> int:
-    """POST ``body`` to vLLM's ``/tokenize`` endpoint and return the token count.
+def _post_tokenize(body: dict[str, Any], *, timeout: float = 60.0) -> list[int]:
+    """POST ``body`` to vLLM's ``/tokenize`` endpoint and return the token ids.
 
-    Uses ``urllib.request`` with a fresh socket per call — see the
-    ``count_prompt_tokens`` perf note. Raises ``RuntimeError`` with the HTTP
-    status / response body on any failure so the caller sees a self-contained
-    error rather than a bare ``URLError``.
+    The ids, not just the count: they are the server's own tokenization of the
+    prompt, which is what training must reproduce, and the endpoint returns
+    them anyway.
+
+    Raises ``RuntimeError`` with the HTTP status and response body on any
+    failure, so the caller sees a self-contained error rather than a bare
+    ``URLError``.
+
+    Opens a fresh socket per call, measured at ~3-15 ms on a loopback path,
+    well below the inference latency it guards. Memoising buys nothing: each
+    invocation carries a different conversation. If it ever matters, the next
+    step is HTTP keep-alive.
     """
     req = urllib.request.Request(
         _tokenize_url(),
@@ -185,11 +193,15 @@ def _post_tokenize(body: dict[str, Any], *, timeout: float = 60.0) -> int:
             f"vllm_tokens: POST {_tokenize_url()} failed: {e}"
         ) from e
     try:
-        return int(out["count"])
+        ids = [int(t) for t in out["tokens"]]
     except (KeyError, TypeError, ValueError) as e:
         raise RuntimeError(
             f"vllm_tokens: unexpected /tokenize response shape: {out!r}"
         ) from e
+    assert len(ids) == int(out["count"]), (
+        f"/tokenize: {len(ids)} ids for count {out['count']}"
+    )
+    return ids
 
 
 # ---------------------------------------------------------------------------
@@ -240,15 +252,15 @@ def preserve_thinking_enabled() -> bool:
     else:
         # Short timeout: fail the calling request quickly with a clear error.
         try:
-            base = _post_tokenize({
+            base = len(_post_tokenize({
                 "messages": _PRESERVE_THINKING_PROBE,
                 "add_generation_prompt": True,
-            }, timeout=5.0)
-            preserved = _post_tokenize({
+            }, timeout=5.0))
+            preserved = len(_post_tokenize({
                 "messages": _PRESERVE_THINKING_PROBE,
                 "add_generation_prompt": True,
                 "chat_template_kwargs": {"preserve_thinking": True},
-            }, timeout=5.0)
+            }, timeout=5.0))
         except RuntimeError as exc:
             raise RuntimeError(
                 f"preserve_thinking autodetect probe failed: {exc}. Ensure "
@@ -341,27 +353,16 @@ def _extract_chat_template_kwargs(llm: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def count_prompt_tokens(
+def tokenize_prompt(
     messages: list[BaseMessage] | list[dict],
     tools: list[dict] | None = None,
     chat_template_kwargs: dict[str, Any] | None = None,
-) -> int:
-    """Return exact prompt token count for the given messages (+ optional tools).
+) -> list[int]:
+    """Return vLLM's own token ids for the prompt these messages render to.
 
-    Accepts either LangChain ``BaseMessage`` instances or already-converted
-    OpenAI dicts. The ``add_generation_prompt`` flag matches vLLM's behaviour
-    for generation requests. ``chat_template_kwargs`` (e.g. ``enable_thinking``)
-    must match whatever is sent to vLLM via ``extra_body`` or the count will
-    diverge from what /chat/completions reports.
-
-    Performance note: this opens a fresh HTTP socket per call. Measured
-    ~3–15 ms on a loopback path, well below the inference latency it guards.
-    Memoising the request body buys nothing — each invocation produces a
-    different conversation, so the cache-hit rate is effectively zero. If
-    profiling ever shows the per-call cost becoming a bottleneck, the next
-    optimisation is HTTP keep-alive (``http.client.HTTPConnection`` with
-    ``Connection: keep-alive``), which saves the ~1–2 ms TCP handshake on
-    every call after the first.
+    The ids are the server's rendering, so training can assert that its local
+    re-render reproduces the exact prompt the model conditioned on rather than
+    only matching its length.
     """
     if messages and isinstance(messages[0], BaseMessage):
         dicts = _messages_to_openai_dicts(messages)  # type: ignore[arg-type]
@@ -376,6 +377,15 @@ def count_prompt_tokens(
     if chat_template_kwargs:
         body["chat_template_kwargs"] = chat_template_kwargs
     return _post_tokenize(body)
+
+
+def count_prompt_tokens(
+    messages: list[BaseMessage] | list[dict],
+    tools: list[dict] | None = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
+) -> int:
+    """Exact prompt token count, for callers that need the size but not the ids."""
+    return len(tokenize_prompt(messages, tools, chat_template_kwargs))
 
 
 # ---------------------------------------------------------------------------
@@ -468,20 +478,23 @@ def prepare_invocation(
     Returns a dict with:
       * ``dynamic_max_tokens`` (int): per-call output ceiling for this prompt.
       * ``prompt_tokens_vllm`` (int): the exact prompt-token count vLLM reported.
+      * ``prompt_token_ids`` (list[int]): vLLM's own ids for that prompt.
       * ``tools`` (list[dict] | None): tool schemas as bound on ``llm``.
       * ``chat_template_kwargs`` (dict): chat-template kwargs as bound on ``llm``.
 
-    All four values reflect what was actually sent to ``/tokenize``.
+    All values reflect what was actually sent to ``/tokenize``.
     """
     tools = _extract_bound_tools(llm)
     chat_template_kwargs = _extract_chat_template_kwargs(llm)
-    prompt_tokens = count_prompt_tokens(
+    prompt_token_ids = tokenize_prompt(
         messages, tools=tools, chat_template_kwargs=chat_template_kwargs,
     )
+    prompt_tokens = len(prompt_token_ids)
     dynamic_max = compute_dynamic_max_tokens(prompt_tokens, agent_name=agent_name)
     return {
         "dynamic_max_tokens": dynamic_max,
         "prompt_tokens_vllm": prompt_tokens,
+        "prompt_token_ids": prompt_token_ids,
         "tools": tools,
         "chat_template_kwargs": chat_template_kwargs,
     }

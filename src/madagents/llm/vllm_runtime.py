@@ -199,6 +199,45 @@ def _extract_sampling_params(llm: Any) -> dict[str, Any]:
     return out
 
 
+def _extract_sampled_tokens(result: Any) -> dict[str, Any] | None:
+    """Return the sampler's per-token ids and logprobs for one generation.
+
+    The OpenAI-compat message carries only post-parser structure, so the tokens
+    the model actually sampled are recoverable solely from the logprobs stream,
+    which is pre-parser (think block, raw tool-call text, and the closing
+    ``<|im_end|>`` all appear verbatim). Token identity comes from vLLM's
+    ``return_tokens_as_token_ids``, which renders each token as ``token_id:N``;
+    an entry in any other shape means the extension was not honoured, so the
+    whole capture is dropped rather than half-trusted.
+
+    Returns None when the response carries no logprobs (nothing was requested,
+    or the backend ignored it).
+    """
+    metadata = getattr(result, "response_metadata", None) or {}
+    entries = ((metadata.get("logprobs") or {}).get("content")) or None
+    if not entries:
+        return None
+
+    token_ids: list[int] = []
+    logprobs: list[float] = []
+    try:
+        for entry in entries:
+            token = entry["token"]
+            if not token.startswith("token_id:"):
+                raise ValueError(f"token {token!r} is not a token id")
+            token_ids.append(int(token.split(":", 1)[1]))
+            logprobs.append(float(entry["logprob"]))
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        # Never raise into the caller: a capture is diagnostic, a live agent
+        # turn is not. Needs return_tokens_as_token_ids for the id form.
+        logger.warning(
+            "vllm_runtime: dropping the sampled-token capture for this call "
+            "(%s: %s)", type(exc).__name__, exc,
+        )
+        return None
+    return {"token_ids": token_ids, "logprobs": logprobs}
+
+
 def _get_existing_bound_max_tokens(llm: Any) -> int | None:
     """Return any ``max_tokens`` already bound on ``llm`` via ``.bind()``.
 
@@ -547,6 +586,16 @@ class VLLMRuntime(LLMRuntime):
                 )
             dynamic_max = caller_max
         bound = llm.bind(max_tokens=dynamic_max)
+        # Only while capturing: the logprobs stream is the sole source of the
+        # tokens the model actually sampled, which importance-sampling
+        # corrections and render-fidelity checks need. It costs roughly one
+        # extra token's worth of record per generated token, so it is on by
+        # default and MADAGENTS_CAPTURE_LOGPROBS=0 opts out where that
+        # compounds (per-call SFT collection over many trials).
+        if (os.environ.get("_MADAGENTS_ENABLE_TRACE")
+                and os.environ.get("MADAGENTS_CAPTURE_LOGPROBS", "1") != "0"):
+            bound = _bind_extra_body(bound, {"return_tokens_as_token_ids": True})
+            bound = bound.bind(logprobs=True)
 
         t0 = time.monotonic()
         result = bound.invoke(messages)
@@ -591,6 +640,13 @@ class VLLMRuntime(LLMRuntime):
                 usage_metadata=usage if isinstance(usage, dict) else None,
                 response_metadata=getattr(result, "response_metadata", None),
                 sampling_params=sampling_params,
+                sampled_tokens=_extract_sampled_tokens(result),
+                # Same opt-out as the logprobs: these are the larger
+                # contributor, since each call stores its whole prompt.
+                prompt_token_ids=(
+                    plan["prompt_token_ids"]
+                    if os.environ.get("MADAGENTS_CAPTURE_LOGPROBS", "1") != "0"
+                    else None),
                 dynamic_max_tokens=dynamic_max,
                 duration_ms=duration_ms,
                 latched_error=latched_error,
