@@ -533,7 +533,7 @@ class VLLMRuntime(LLMRuntime):
         *,
         tools: list | None = None,
         chat_template_kwargs: dict | None = None,
-    ) -> int:
+    ) -> int | None:
         """Exact prompt-token count for ``messages`` via vLLM's ``/tokenize``.
 
         ``chat_template_kwargs=None`` counts with the kwargs every agent
@@ -544,7 +544,12 @@ class VLLMRuntime(LLMRuntime):
         deliberately not caught: a broken local tokenizer is a real fault
         that must surface, not silently degrade the summarizer gate to a
         heuristic.
+
+        With ``VLLM_TOKENIZE=0`` (a server without ``/tokenize``) this
+        returns ``None`` and callers fall back to their heuristic.
         """
+        if not vllm_tokens.tokenize_enabled():
+            return None
         if chat_template_kwargs is None:
             chat_template_kwargs = _default_template_kwargs()
         return vllm_tokens.count_prompt_tokens(
@@ -566,24 +571,35 @@ class VLLMRuntime(LLMRuntime):
     ) -> Any:
         messages = _consolidate_system_messages(list(messages))
         messages = _fix_trailing_assistant(messages)
-        plan = vllm_tokens.prepare_invocation(
-            llm, messages, agent_name=agent_name,
-        )
+        if vllm_tokens.tokenize_enabled():
+            plan = vllm_tokens.prepare_invocation(
+                llm, messages, agent_name=agent_name,
+            )
+        else:
+            plan = vllm_tokens.prepare_invocation_static(llm, agent_name=agent_name)
         dynamic_max = plan["dynamic_max_tokens"]
         # Caller's ``.bind(max_tokens=N)`` takes precedence, in either
         # direction.  Tighter is safe and silent.  Looser is honoured with a
-        # WARNING: it may exceed the remaining context budget, in which case
-        # vLLM will reject the request.
+        # WARNING: it may exceed what the server accepts.
         caller_max = _get_existing_bound_max_tokens(llm)
         if caller_max is not None and caller_max != dynamic_max:
             if caller_max > dynamic_max:
-                logger.warning(
-                    "vllm_runtime: caller-bound max_tokens=%d exceeds the "
-                    "dynamic cap %d for agent=%s. Honouring it; vLLM will "
-                    "reject the request if prompt_tokens + max_tokens > "
-                    "MAX_MODEL_LEN.",
-                    caller_max, dynamic_max, agent_name,
-                )
+                if plan["prompt_tokens_vllm"] is not None:
+                    logger.warning(
+                        "vllm_runtime: caller-bound max_tokens=%d exceeds the "
+                        "dynamic cap %d for agent=%s. Honouring it; vLLM will "
+                        "reject the request if prompt_tokens + max_tokens > "
+                        "MAX_MODEL_LEN.",
+                        caller_max, dynamic_max, agent_name,
+                    )
+                else:
+                    logger.warning(
+                        "vllm_runtime: caller-bound max_tokens=%d exceeds the "
+                        "static cap %d for agent=%s. Honouring it; the server "
+                        "may reject the request (context overflow, or a "
+                        "gateway's balance pre-authorization).",
+                        caller_max, dynamic_max, agent_name,
+                    )
             dynamic_max = caller_max
         bound = llm.bind(max_tokens=dynamic_max)
         # Only while capturing: the logprobs stream is the sole source of the
@@ -591,8 +607,12 @@ class VLLMRuntime(LLMRuntime):
         # corrections and render-fidelity checks need. It costs roughly one
         # extra token's worth of record per generated token, so it is on by
         # default and MADAGENTS_CAPTURE_LOGPROBS=0 opts out where that
-        # compounds (per-call SFT collection over many trials).
-        if (os.environ.get("_MADAGENTS_ENABLE_TRACE")
+        # compounds (per-call SFT collection over many trials). Skipped
+        # without /tokenize (VLLM_TOKENIZE=0): a server without vLLM's admin
+        # endpoints is not expected to honour the vLLM-specific token-id
+        # extension either.
+        if (vllm_tokens.tokenize_enabled()
+                and os.environ.get("_MADAGENTS_ENABLE_TRACE")
                 and os.environ.get("MADAGENTS_CAPTURE_LOGPROBS", "1") != "0"):
             bound = _bind_extra_body(bound, {"return_tokens_as_token_ids": True})
             bound = bound.bind(logprobs=True)
@@ -612,7 +632,8 @@ class VLLMRuntime(LLMRuntime):
             usage.get("input_tokens") if isinstance(usage, dict) else None
         )
         if (
-            response_input_tokens is not None
+            plan["prompt_tokens_vllm"] is not None
+            and response_input_tokens is not None
             and response_input_tokens != plan["prompt_tokens_vllm"]
         ):
             latched_error = (

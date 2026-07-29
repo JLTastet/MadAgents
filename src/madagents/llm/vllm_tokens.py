@@ -24,6 +24,7 @@ loopback path, well below the inference latency of the call it guards.
 """
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -141,6 +142,49 @@ def summarizer_token_threshold() -> int:
 # vLLM /tokenize plumbing
 # ---------------------------------------------------------------------------
 
+_TOKENIZE_ENV = "VLLM_TOKENIZE"
+
+
+@functools.cache
+def tokenize_enabled() -> bool:
+    """Whether the server is expected to expose vLLM's ``/tokenize`` endpoint.
+
+    ``VLLM_TOKENIZE=0`` declares an OpenAI-compatible server without vLLM's
+    admin endpoints (e.g. a hosted gateway): exact token accounting is
+    replaced by static per-agent output ceilings and the summarizer gate
+    falls back to its heuristic counter. Unset or ``1`` keeps exact
+    accounting.
+
+    The verdict is cached for the process (the serving mode cannot change
+    mid-run; tests reset via ``tokenize_enabled.cache_clear()``) and the
+    disabled mode logs an INFO marker at first resolution. Disabling raises
+    when trace capture expects token-grade records, which this mode cannot
+    produce.
+    """
+    env = os.environ.get(_TOKENIZE_ENV, "").strip()
+    if env and env not in ("0", "1"):
+        raise RuntimeError(
+            f"vllm_tokens: {_TOKENIZE_ENV}={env!r} is invalid. "
+            f"Use '1', '0', or leave it unset."
+        )
+    enabled = env != "0"
+    if not enabled:
+        if (os.environ.get("_MADAGENTS_ENABLE_TRACE")
+                and os.environ.get("MADAGENTS_CAPTURE_LOGPROBS", "1") != "0"):
+            raise RuntimeError(
+                f"vllm_tokens: {_TOKENIZE_ENV}=0 cannot produce token-grade "
+                f"traces (no /tokenize, no token-id logprobs), but trace "
+                f"capture is enabled with logprobs on. Set "
+                f"MADAGENTS_CAPTURE_LOGPROBS=0 to confirm usage-only capture, "
+                f"or unset {_TOKENIZE_ENV}."
+            )
+        logger.info(
+            "vllm_tokens: tokenizer-less mode active (%s=0): static output "
+            "ceilings, heuristic summarizer gate, usage-only traces.",
+            _TOKENIZE_ENV,
+        )
+    return enabled
+
 
 def _tokenize_url() -> str:
     """Return the absolute URL of vLLM's ``/tokenize`` endpoint.
@@ -250,6 +294,12 @@ def preserve_thinking_enabled() -> bool:
             "enabled" if enabled else "disabled", _PRESERVE_THINKING_ENV, env,
         )
     else:
+        if not tokenize_enabled():
+            raise RuntimeError(
+                f"vllm_tokens: the preserve_thinking autodetect probe needs "
+                f"/tokenize, which {_TOKENIZE_ENV}=0 declares absent. Set "
+                f"{_PRESERVE_THINKING_ENV}=1 or 0 explicitly for this server."
+            )
         # Short timeout: fail the calling request quickly with a clear error.
         try:
             base = len(_post_tokenize({
@@ -497,4 +547,33 @@ def prepare_invocation(
         "prompt_token_ids": prompt_token_ids,
         "tools": tools,
         "chat_template_kwargs": chat_template_kwargs,
+    }
+
+
+def prepare_invocation_static(
+    llm: Any,
+    *,
+    agent_name: str | None,
+) -> dict[str, Any]:
+    """Pre-call accounting when the server has no ``/tokenize`` endpoint.
+
+    Same shape as ``prepare_invocation``, differing in:
+
+      * ``dynamic_max_tokens``: the static per-agent ceiling, with unbounded
+        agents (the summarizer) capped at ``VLLM_MAX_SUMMARIZER_OUTPUT``
+        ("all remaining context" needs a prompt count).
+      * ``prompt_tokens_vllm`` / ``prompt_token_ids``: ``None``.
+
+    Modest static caps also bound the exposure to gateways that pre-authorize
+    ``max_tokens`` against an account balance.
+    """
+    ceiling = VLLM_AGENT_OUTPUT_CEILINGS.get(agent_name, VLLM_DEFAULT_MAX_OUTPUT)  # type: ignore[arg-type]
+    if ceiling is None:
+        ceiling = VLLM_MAX_SUMMARIZER_OUTPUT
+    return {
+        "dynamic_max_tokens": ceiling,
+        "prompt_tokens_vllm": None,
+        "prompt_token_ids": None,
+        "tools": _extract_bound_tools(llm),
+        "chat_template_kwargs": _extract_chat_template_kwargs(llm),
     }

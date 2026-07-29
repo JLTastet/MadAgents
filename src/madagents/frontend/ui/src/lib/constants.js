@@ -50,6 +50,7 @@ export const SUPPORTED_MODELS = [
   "claude-haiku-4-5",
   "qwen3.5-4b",
   "qwen3.5-27b",
+  "qwen3.5-397b",
   "qwen3.6-27b",
 ];
 
@@ -148,6 +149,7 @@ const MODEL_TIERS = {
   "claude-sonnet-4-6": "mid-tier",
   "claude-haiku-4-5": "lightest",
   "qwen3.5-27b": "strongest",
+  "qwen3.5-397b": "strongest",
   "qwen3.6-27b": "strongest",
   "qwen3.5-4b": "lightest",
 };

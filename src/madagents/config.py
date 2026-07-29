@@ -18,6 +18,7 @@ SUPPORTED_MODELS: List[str] = [
     "claude-haiku-4-5",
     "qwen3.5-4b",
     "qwen3.5-27b",
+    "qwen3.5-397b",
     "qwen3.6-27b",
 ]
 
@@ -59,6 +60,7 @@ OPENAI_MODEL_TIERS: Dict[str, tuple[str, str]] = {
 QWEN_MODEL_TIERS: Dict[str, tuple[str, str]] = {
     "qwen3.6-27b": ("strongest", "Complex reasoning, physics, domain expertise, code generation"),
     "qwen3.5-27b": ("strongest", "Complex reasoning, physics, domain expertise, code generation"),
+    "qwen3.5-397b": ("strongest", "Complex reasoning, physics, domain expertise, code generation"),
     "qwen3.5-4b": ("lightest", "Simple extraction, formatting, lookups"),
 }
 

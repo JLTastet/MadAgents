@@ -256,7 +256,7 @@ class TraceRecorder:
         input_messages: list[BaseMessage],
         tools: list[dict] | None,
         chat_template_kwargs: dict[str, Any],
-        prompt_tokens_vllm: int,
+        prompt_tokens_vllm: int | None,
         output_message: AIMessage,
         usage_metadata: dict | None,
         response_metadata: dict | None,
@@ -268,6 +268,10 @@ class TraceRecorder:
         latched_error: str | None,
     ) -> None:
         """Record one VLLMRuntime.invoke call.
+
+        ``prompt_tokens_vllm`` is ``None`` when the server has no
+        ``/tokenize`` endpoint (``VLLM_TOKENIZE=0``): the record then carries
+        only response-reported usage.
 
         ``reasoning_effort`` is intentionally not a parameter: the wire-faithful
         signal for whether thinking was on lives in
@@ -316,7 +320,7 @@ class TraceRecorder:
         input_messages: list[BaseMessage],
         tools: list[dict] | None,
         chat_template_kwargs: dict[str, Any],
-        prompt_tokens_vllm: int,
+        prompt_tokens_vllm: int | None,
         output_message: AIMessage,
         usage_metadata: dict | None,
         response_metadata: dict | None,
@@ -364,7 +368,9 @@ class TraceRecorder:
             "input_messages": input_dicts,
             "tools": tools_snapshot,
             "output_message": _output_message_to_dict(output_message),
-            "prompt_tokens_vllm": int(prompt_tokens_vllm),
+            "prompt_tokens_vllm": (
+                int(prompt_tokens_vllm) if prompt_tokens_vllm is not None else None
+            ),
             "usage_metadata": dict(usage_metadata) if isinstance(usage_metadata, dict) else None,
             "response_metadata": _strip_logprobs(response_metadata, sampled_tokens),
             "sampling_params": dict(sampling_params or {}),
