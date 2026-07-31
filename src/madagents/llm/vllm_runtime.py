@@ -9,7 +9,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from madagents.config import REASONING_EFFORT_LEVELS
@@ -424,6 +424,40 @@ def _fix_trailing_assistant(messages: list[BaseMessage]) -> list[BaseMessage]:
     return list(messages)
 
 
+# Content of the placeholder user turn inserted by _ensure_user_query: cheap
+# (~2 tokens) and inert. Change here if it turns out to influence the model.
+_PLACEHOLDER_USER_CONTENT = "."
+
+
+def _ensure_user_query(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """Insert a placeholder user turn into a history with no user message.
+
+    Qwen chat templates refuse to render such histories ("No user query
+    found in messages."), which arise legitimately when summarization
+    absorbs the last user message into the system prompt. The placeholder
+    goes after the leading system messages (Qwen requires system first; a
+    trailing user turn reads as a fresh instruction, see
+    ``_fix_trailing_assistant``). Warns on every insertion.
+    """
+    # Ceiling: the template also discounts user turns that are entirely a
+    # <tool_response> wrapper; MadAgents never produces those.
+    if any(isinstance(m, HumanMessage) for m in messages):
+        return messages
+    idx = 0
+    while idx < len(messages) and isinstance(messages[idx], SystemMessage):
+        idx += 1
+    logger.warning(
+        "vllm_runtime: no user query in a %d-message list; inserting a "
+        "placeholder user message at index %d so the chat template renders.",
+        len(messages), idx,
+    )
+    return [
+        *messages[:idx],
+        HumanMessage(content=_PLACEHOLDER_USER_CONTENT),
+        *messages[idx:],
+    ]
+
+
 # ---------------------------------------------------------------------------
 # VLLMRuntime
 # ---------------------------------------------------------------------------
@@ -539,22 +573,31 @@ class VLLMRuntime(LLMRuntime):
         ``chat_template_kwargs=None`` counts with the kwargs every agent
         request carries by default, so gate counts match production renders
         (a bare render would under-count replayed reasoning on Qwen3.6);
-        pass ``{}`` explicitly to count a bare render. A ``/tokenize``
-        failure raises ``RuntimeError`` (from ``count_prompt_tokens``) and is
-        deliberately not caught: a broken local tokenizer is a real fault
-        that must surface, not silently degrade the summarizer gate to a
-        heuristic.
+        pass ``{}`` explicitly to count a bare render.
 
-        With ``VLLM_TOKENIZE=0`` (a server without ``/tokenize``) this
-        returns ``None`` and callers fall back to their heuristic.
+        Returns ``None`` when no exact count is available (``VLLM_TOKENIZE=0``,
+        or a template-rejection HTTP 400) and callers fall back to their
+        heuristic. Any other failure raises: a broken tokenizer or a
+        misconfigured endpoint must surface.
         """
         if not vllm_tokens.tokenize_enabled():
             return None
         if chat_template_kwargs is None:
             chat_template_kwargs = _default_template_kwargs()
-        return vllm_tokens.count_prompt_tokens(
-            messages, tools=tools, chat_template_kwargs=chat_template_kwargs,
-        )
+        messages = _ensure_user_query(messages)
+        try:
+            return vllm_tokens.count_prompt_tokens(
+                messages, tools=tools, chat_template_kwargs=chat_template_kwargs,
+            )
+        except vllm_tokens.TokenizeHTTPError as e:
+            if e.status != 400:
+                raise
+            logger.warning(
+                "vllm_runtime: /tokenize rejected the count request (%s); "
+                "returning None so the caller falls back to its heuristic.",
+                e,
+            )
+            return None
 
     def invoke(
         self,
@@ -571,10 +614,25 @@ class VLLMRuntime(LLMRuntime):
     ) -> Any:
         messages = _consolidate_system_messages(list(messages))
         messages = _fix_trailing_assistant(messages)
+        messages = _ensure_user_query(messages)
         if vllm_tokens.tokenize_enabled():
-            plan = vllm_tokens.prepare_invocation(
-                llm, messages, agent_name=agent_name,
-            )
+            try:
+                plan = vllm_tokens.prepare_invocation(
+                    llm, messages, agent_name=agent_name,
+                )
+            except vllm_tokens.TokenizeHTTPError as e:
+                if e.status != 400:
+                    raise
+                logger.warning(
+                    "vllm_runtime: /tokenize rejected the prompt for agent=%s "
+                    "(%s); using a static output ceiling for this call. If "
+                    "the chat template itself rejects the prompt, generation "
+                    "will fail the same way.",
+                    agent_name, e,
+                )
+                plan = vllm_tokens.prepare_invocation_static(
+                    llm, agent_name=agent_name,
+                )
         else:
             plan = vllm_tokens.prepare_invocation_static(llm, agent_name=agent_name)
         dynamic_max = plan["dynamic_max_tokens"]

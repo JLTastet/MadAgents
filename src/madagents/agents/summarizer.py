@@ -1,5 +1,6 @@
 from typing import Any, Tuple
 
+import functools
 import logging
 import math
 import json
@@ -58,6 +59,7 @@ Key paths, configurations, software versions, active sessions. Filesystem/enviro
 
 # Prepended to count an assistant-led slice: vLLM rejects a message list with no
 # user query. Subtracting its standalone cost recovers the slice's own tokens.
+# Kept alongside _ensure_user_query: exact counts, and its warning stays quiet.
 _DUMMY_USER = HumanMessage(content=".")
 
 class Summarizer:
@@ -224,7 +226,7 @@ class Summarizer:
         """
         if not messages:
             return 0
-        dummy = self._dummy_user_tokens()
+        dummy = self._dummy_user_tokens
         if dummy is None:
             # The runtime has no exact token counter; fall back to the heuristic.
             return approx_tokens_in_messages(messages)
@@ -271,20 +273,27 @@ class Summarizer:
         difference is the slice's own contribution (verified for Qwen3.5; a
         template that merges adjacent same-role turns would make it approximate).
         Tools-free because the anchor's ``input_tokens`` already counts the tool
-        schemas.
+        schemas. When the exact counter declines the slice (``count_tokens``
+        returns ``None`` on a template-rejection 400), returns the character
+        heuristic's estimate instead.
         """
         n = self.runtime.count_tokens([_DUMMY_USER, *messages])
-        assert n is not None  # dummy is not None, so the tokenizer returns an int
+        if n is None:
+            # The runtime already warned with the status and body excerpt.
+            logger.info(
+                "summarizer: exact token count unavailable for a %d-message "
+                "slice; using the character heuristic.",
+                len(messages),
+            )
+            return approx_tokens_in_messages(messages)
         return n - dummy
 
+    @functools.cached_property
     def _dummy_user_tokens(self) -> int | None:
-        """Token cost of ``_DUMMY_USER``, cached. ``None`` means the runtime's
-        ``count_tokens`` returns ``None`` (no exact token counter), so the caller
-        falls back to the char heuristic.
+        """Token cost of ``_DUMMY_USER``; ``None`` means no exact token
+        counter, and the caller falls back to the char heuristic.
         """
-        if not hasattr(self, "_dummy_user_token_cache"):
-            self._dummy_user_token_cache = self.runtime.count_tokens([_DUMMY_USER])
-        return self._dummy_user_token_cache
+        return self.runtime.count_tokens([_DUMMY_USER])
 
 #########################################################################
 ## Approximate token count ##############################################

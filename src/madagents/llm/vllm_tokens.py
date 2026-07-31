@@ -199,6 +199,20 @@ def _tokenize_url() -> str:
     return base + "/tokenize"
 
 
+class TokenizeHTTPError(RuntimeError):
+    """``/tokenize`` returned an HTTP error response; ``status`` carries the code.
+
+    A ``RuntimeError`` subclass so call sites that treat any tokenize failure
+    as fatal keep doing so; callers that can degrade (e.g. fall back to a
+    heuristic count on a template-rejection 400) catch this type and inspect
+    ``status``.
+    """
+
+    def __init__(self, message: str, status: int) -> None:
+        super().__init__(message)
+        self.status = status
+
+
 def _post_tokenize(body: dict[str, Any], *, timeout: float = 60.0) -> list[int]:
     """POST ``body`` to vLLM's ``/tokenize`` endpoint and return the token ids.
 
@@ -206,9 +220,9 @@ def _post_tokenize(body: dict[str, Any], *, timeout: float = 60.0) -> list[int]:
     prompt, which is what training must reproduce, and the endpoint returns
     them anyway.
 
-    Raises ``RuntimeError`` with the HTTP status and response body on any
-    failure, so the caller sees a self-contained error rather than a bare
-    ``URLError``.
+    Raises ``TokenizeHTTPError`` when the server answers with an HTTP error
+    status, and plain ``RuntimeError`` on any other failure, so the caller
+    sees a self-contained error rather than a bare ``URLError``.
 
     Opens a fresh socket per call, measured at ~3-15 ms on a loopback path,
     well below the inference latency it guards. Memoising buys nothing: each
@@ -226,9 +240,10 @@ def _post_tokenize(body: dict[str, Any], *, timeout: float = 60.0) -> list[int]:
             out = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body_excerpt = e.read().decode("utf-8", "replace")[:500]
-        raise RuntimeError(
+        raise TokenizeHTTPError(
             f"vllm_tokens: POST {_tokenize_url()} returned HTTP {e.code}: "
-            f"{body_excerpt}"
+            f"{body_excerpt}",
+            status=e.code,
         ) from e
     except (OSError, ValueError) as e:
         # OSError covers URLError and mid-read socket timeouts; ValueError
