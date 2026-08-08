@@ -230,6 +230,15 @@ fi
 IMAGE="$(resolve_path "${APPTAINER_IMAGE:-image/madagents.sif}")"
 OVERLAY="$(resolve_path "${APPTAINER_OVERLAY:-image/mad_overlay.img}")"
 
+# A ":ro" suffix on APPTAINER_OVERLAY attaches the overlay read-only with a
+# throwaway tmpfs upper layer. Concurrent instances can then share one
+# overlay image (a writable attach takes an exclusive lock), and every run
+# starts from the same pristine state.
+WRITABLE_TMPFS_ARGS=()
+if [[ "${OVERLAY}" == *:ro ]]; then
+  WRITABLE_TMPFS_ARGS=(--writable-tmpfs)
+fi
+
 MADRUN_LOG="${LOGDIR}/madrun.log"
 APPTAINER_LOG="${LOGDIR}/apptainer.log"
 LINKS_LOG="${LOGDIR}/madagents_links.txt"
@@ -282,16 +291,20 @@ rm -rf -- "${RUN_DIR}/user_bridge" || true
 # Clean up overlay artifacts left by claude_code/madrun.sh.
 # Claude Code creates /workspace as a directory for bind mounts;
 # v1.1 needs it as a symlink for its workspace management.
-"${APPTAINER_BIN}" exec \
-  --fakeroot \
-  --overlay "${OVERLAY}" \
-  "${IMAGE}" \
-  bash -c '
-    for d in /project /prompts; do rmdir "$d" 2>/dev/null || true; done
-    if [ -d /workspace ]; then
-      if [ -L /workspace ]; then :; else rmdir /workspace 2>/dev/null || true; fi
-    fi
-  ' 2>/dev/null || true
+# On a read-only overlay nothing the cleanup does could persist, so skip
+# the writable attach. The image must already be clean of such artifacts.
+if [[ "${OVERLAY}" != *:ro ]]; then
+  "${APPTAINER_BIN}" exec \
+    --fakeroot \
+    --overlay "${OVERLAY}" \
+    "${IMAGE}" \
+    bash -c '
+      for d in /project /prompts; do rmdir "$d" 2>/dev/null || true; done
+      if [ -d /workspace ]; then
+        if [ -L /workspace ]; then :; else rmdir /workspace 2>/dev/null || true; fi
+      fi
+    ' 2>/dev/null || true
+fi
 
 # ---------- startup message ----------
 echo "Starting MadAgents ..."
@@ -300,7 +313,10 @@ echo "Starting MadAgents ..."
 # TODO: Use
 # --overlay "${OVERLAY}" \
 # --overlay "${OVERLAY}":/opt \
-INSTANCE_BASE="madagents"
+# The PID makes the name unique per launch: a recycled name could
+# otherwise be claimed by a concurrent instance and stopped in its place
+# by this launch's fallback teardown.
+INSTANCE_BASE="madagents-$$"
 for i in $(seq 0 999); do
   if (( i == 0 )); then
     candidate="${INSTANCE_BASE}"
@@ -320,6 +336,7 @@ for i in $(seq 0 999); do
       -B "${output_dir}:/output" \
       -B "${RUN_DIR}:/runs" \
       --overlay "${OVERLAY}" \
+      "${WRITABLE_TMPFS_ARGS[@]}" \
       "${IMAGE}" \
       "${candidate}"
   ) >"${APPTAINER_LOG}" 2>&1; then
