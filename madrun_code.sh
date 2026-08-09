@@ -383,7 +383,12 @@ for i in $(seq 0 99); do
   # --overlay" maintenance shell outside madrun_code.sh.
   if (
     eval "exec ${LOCK_FD}>&-"
+    # --no-home stops Apptainer from bind-mounting the host home (its
+    # default). The container reaches everything it needs through the
+    # explicit binds below; a mounted home is writable, so an in-container
+    # process could otherwise alter the host's dotfiles or data.
     "${APPTAINER_BIN}" instance start \
+      --no-home \
       --cleanenv \
       --env "CLAUDE_CONFIG_DIR=/opt/.config/.claude" \
       --env "TERM=${TERM:-xterm-256color}" \

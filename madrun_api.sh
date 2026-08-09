@@ -328,8 +328,13 @@ for i in $(seq 0 999); do
   # and leave .madrun.lock permanently held after the script exits.
   if (
     eval "exec ${LOCK_FD}>&-"
+    # --no-home stops Apptainer from bind-mounting the host home (its
+    # default). The container reaches everything it needs through the
+    # explicit binds below; a mounted home is writable, so an in-container
+    # process could otherwise alter the host's dotfiles or data.
     "${APPTAINER_BIN}" instance start \
       --fakeroot \
+      --no-home \
       -B "${SRC_DIR}:/MadAgents/src:ro" \
       -B "${UI_DIR}:/MadAgents/src/madagents/frontend/ui" \
       -B "${MADGRAPH_DOCS_DIR}:/madgraph_docs:ro" \
