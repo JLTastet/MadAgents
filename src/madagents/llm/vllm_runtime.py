@@ -476,7 +476,22 @@ class VLLMRuntime(LLMRuntime):
     ) -> ChatOpenAI:
         vllm_model = _resolve_vllm_model()
         vllm_url = _resolve_vllm_url()
-        sampling = _get_sampling_defaults(_resolve_base_model_name(vllm_model, vllm_url))
+        sampling = dict(_get_sampling_defaults(_resolve_base_model_name(vllm_model, vllm_url)))
+
+        # Optional env overrides on top of the family preset (e.g. rollout
+        # temperature for RL experiments). Unset or empty keeps the preset.
+        for key, env_var, cast in (
+            ("temperature", "VLLM_TEMPERATURE", float),
+            ("top_p", "VLLM_TOP_P", float),
+            ("top_k", "VLLM_TOP_K", int),
+        ):
+            raw = os.environ.get(env_var)
+            if raw:
+                try:
+                    sampling[key] = cast(raw)
+                except ValueError:
+                    logger.warning("%s=%r is not a valid %s; keeping preset %s=%s",
+                                   env_var, raw, cast.__name__, key, sampling[key])
 
         _reject_unsupported_caller_max_tokens(max_tokens)
 
