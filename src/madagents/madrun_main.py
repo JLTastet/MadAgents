@@ -1,3 +1,4 @@
+import fcntl
 import time
 from typing import Optional, List
 import argparse
@@ -13,19 +14,37 @@ import subprocess
 from pathlib import Path
 
 def run_npm_install():
-    """Install required frontend dependencies and log output to disk."""
-    project_dir = Path("/MadAgents/src/madagents/frontend/ui")
-    log_path = Path("/runs/logs/npm_install.log")
-    log_path.parent.mkdir(exist_ok=True, parents=True)
+    """Install required frontend dependencies and log output to disk.
 
-    with open(log_path, "w") as log_file:
-        result = subprocess.run(
-            ["npm", "install", "remark-math", "rehype-katex", "katex"],
-            cwd=project_dir,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            text=True
-        )
+    Concurrent boots race the install in the shared UI bind mount, so
+    the presence check and the install both run under a lock file
+    there: exactly one boot installs, the others wait and skip.
+    Presence means a package's own package.json exists, which a killed
+    half-finished install leaves absent.
+    """
+    project_dir = Path("/MadAgents/src/madagents/frontend/ui")
+    packages = ["remark-math", "rehype-katex", "katex"]
+    node_modules = project_dir / "node_modules"
+
+    def all_present():
+        return all((node_modules / package / "package.json").is_file()
+                   for package in packages)
+
+    node_modules.mkdir(exist_ok=True)
+    with open(node_modules / ".install.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if all_present():
+            return 0
+        log_path = Path("/runs/logs/npm_install.log")
+        log_path.parent.mkdir(exist_ok=True, parents=True)
+        with open(log_path, "w") as log_file:
+            result = subprocess.run(
+                ["npm", "install", *packages],
+                cwd=project_dir,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                text=True
+            )
     return result.returncode
 
 def write_interface_links(frontend_port: int, backend_port: int) -> None:
