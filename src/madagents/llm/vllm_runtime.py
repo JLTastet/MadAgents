@@ -7,6 +7,7 @@ import os
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
@@ -458,6 +459,9 @@ def _ensure_user_query(messages: list[BaseMessage]) -> list[BaseMessage]:
     ]
 
 
+_TOOL_REPEAT_LIMIT_DEFAULT = 10
+
+
 # ---------------------------------------------------------------------------
 # VLLMRuntime
 # ---------------------------------------------------------------------------
@@ -465,6 +469,20 @@ def _ensure_user_query(messages: list[BaseMessage]) -> list[BaseMessage]:
 
 class VLLMRuntime(LLMRuntime):
     """Runtime for models served by vLLM via the OpenAI-compatible API."""
+
+    def __init__(self) -> None:
+        # Repetition-watchdog counts, keyed (agent, tool name, JSON-serialised
+        # args), live as long as this runtime, i.e. the loaded run's MadAgents
+        # object: one eval trial, or every turn of one interactive run (the
+        # backend rebuilds MadAgents when it loads another run). If an
+        # interactive run ever aborts on counts from earlier turns, reset
+        # the counter per turn from the backend.
+        self._tool_call_counts: Counter[tuple[str, str, str]] = Counter()
+        # Empty means unset: the container forwarder exports the variable
+        # even when the host never set it.
+        self._tool_repeat_limit = int(
+            os.environ.get("MADAGENTS_TOOL_REPEAT_LIMIT") or _TOOL_REPEAT_LIMIT_DEFAULT
+        )
 
     def create_chat_model(
         self,
@@ -614,6 +632,32 @@ class VLLMRuntime(LLMRuntime):
             )
             return None
 
+    def _check_tool_repeats(self, result: Any, agent_name: str | None) -> None:
+        """Repetition watchdog: raise once ``agent_name`` has emitted the same
+        tool call (name and arguments) ``MADAGENTS_TOOL_REPEAT_LIMIT`` times
+        anywhere in the run, consecutively or not.
+
+        A looping agent repeats one call verbatim. Raising here ends the run
+        through the backend's error path, like a step-limit hit, before the
+        call executes.
+        """
+        limit = self._tool_repeat_limit
+        if limit <= 0:
+            return
+        agent = agent_name or ""
+        for tc in getattr(result, "tool_calls", None) or []:
+            tool = tc.get("name") or ""
+            args_json = json.dumps(tc.get("args"), sort_keys=True, default=str)
+            key = (agent, tool, args_json)
+            self._tool_call_counts[key] += 1
+            if self._tool_call_counts[key] >= limit:
+                args_preview = args_json[:300] + ("..." if len(args_json) > 300 else "")
+                raise RuntimeError(
+                    f"Repetition watchdog: {agent} issued {tool}({args_preview}) "
+                    f"{limit} times. Aborting the workflow "
+                    f"(MADAGENTS_TOOL_REPEAT_LIMIT={limit})."
+                )
+
     def invoke(
         self,
         llm: Any,
@@ -745,6 +789,7 @@ class VLLMRuntime(LLMRuntime):
                 duration_ms=duration_ms,
                 latched_error=latched_error,
             )
+        self._check_tool_repeats(result, agent_name)
         return result
 
     def with_structured_output(
