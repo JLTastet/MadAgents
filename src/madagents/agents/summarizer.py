@@ -223,6 +223,11 @@ class Summarizer:
         the exact size of that reply plus the messages appended since. Recounting
         from the reply rather than adding its ``output_tokens`` measures its
         closing template tokens, so the estimate never under-counts.
+
+        A reply whose prompt was compacted relative to the slice is skipped:
+        the gate counts from the newest older reply whose prompt still covers
+        the slice before it. When no reply passes, the count falls back to the
+        slice alone and omits the preamble, tools and summary.
         """
         if not messages:
             return 0
@@ -231,31 +236,62 @@ class Summarizer:
             # The runtime has no exact token counter; fall back to the heuristic.
             return approx_tokens_in_messages(messages)
 
+        compacted_anchor = None  # (input_tokens, index) of the newest anchor the tripwire rejected
         for i in range(len(messages) - 1, -1, -1):
             base = _exact_input(messages[i])
-            if base is not None:
-                # Tripwire for a compacted (cross-context) anchor. Sound and
-                # false-positive-free: in the consistent case ``base`` is the
-                # preamble + tools + summary + these preceding messages, so it always
-                # exceeds their size; only a compacted anchor can fall below it.
-                if base < approx_tokens_in_messages(messages[:i]):
-                    logger.warning(
-                        "summarizer: anchor input_tokens=%d is below the heuristic "
-                        "size of the %d message(s) before it in this slice; the "
-                        "anchor's prompt was compacted relative to the slice, so the "
-                        "gate under-counts (likely a re-dispatched sub-agent that "
-                        "internally summarized).",
-                        base, i,
-                    )
-                return base + self._slice_tokens(messages[i:], dummy)
+            if base is None:
+                continue
+            # Tripwire for a compacted (cross-context) anchor. A consistent
+            # ``base`` is the preamble + tools + summary + these preceding
+            # messages, so it normally exceeds their heuristic size. One that
+            # falls below it no longer covers them (a re-dispatched sub-agent
+            # that internally summarized) and would under-count. Keep walking
+            # back to the newest reply that still passes.
+            #
+            # Limits of the check:
+            # - The heuristic can over-estimate, so the wire can misfire on a
+            #   consistent anchor. Safe: the older anchor it lands on still
+            #   covers the slice before it.
+            # - Anchors near the start of the slice pass trivially (little
+            #   precedes them), so a compaction reaching that far back goes
+            #   undetected and the count can still fall short by the
+            #   compacted-away part. Never worse than counting from the newest
+            #   reply.
+            # - Counting the prefix per anchor makes this path O(n * anchors).
+            #   Fine for hundreds of messages. Switch to prefix sums if it
+            #   ever costs measurably.
+            if base < approx_tokens_in_messages(messages[:i]):
+                if compacted_anchor is None:
+                    compacted_anchor = (base, i)
+                continue
+            total = base + self._slice_tokens(messages[i:], dummy)
+            if compacted_anchor is not None:
+                logger.warning(
+                    "summarizer: anchor input_tokens=%d is below the heuristic "
+                    "size of the %d message(s) before it in this slice, so its "
+                    "prompt appears compacted relative to the slice (likely a "
+                    "re-dispatched sub-agent that internally summarized); the gate "
+                    "counts from the older reply at index %d instead: %d tokens.",
+                    *compacted_anchor, i, total,
+                )
+            return total
 
-        # No recorded reply in the slice. This is normal when the slice is small:
-        # a fresh slice, or one holding only synthetic display messages (the
-        # orchestrator builds AIMessages without usage_metadata). A slice large
-        # enough to fire the gate with no anchor is suspicious, since real replies
-        # carry input_tokens.
+        # No usable reply in the slice: count the slice itself (preamble, tools
+        # and summary excluded). With no anchor at all this is normal when the
+        # slice is small: a fresh slice, or one holding only synthetic display
+        # messages (the orchestrator builds AIMessages without usage_metadata).
+        # A slice large enough to fire the gate with no anchor is suspicious,
+        # since real replies carry input_tokens.
         slice_tokens = self._slice_tokens(messages, dummy)
-        if slice_tokens >= self.token_threshold and any(isinstance(m, AIMessage) for m in messages):
+        if compacted_anchor is not None:
+            logger.warning(
+                "summarizer: anchor input_tokens=%d is below the heuristic size of "
+                "the %d message(s) before it in this slice and no older reply is "
+                "consistent with it; counting the slice exactly, without the "
+                "preamble, tools and summary.",
+                *compacted_anchor,
+            )
+        elif slice_tokens >= self.token_threshold and any(isinstance(m, AIMessage) for m in messages):
             logger.warning(
                 "summarizer: the gate slice reaches the threshold (%d tokens) but "
                 "none of its assistant messages carry usage_metadata input_tokens; "
