@@ -121,13 +121,15 @@ export APPTAINERENV_NPM_CONFIG_CACHE="${NPM_CONFIG_CACHE}"
 # MADAGENTS_VLLM_SEED, and MADAGENTS_TOKENIZER_REVISION per trial.
 # _MADAGENTS_ENABLE_TRACE (internal, set by the runner only when
 # --capture-traces was passed) is read in-container to gate the heavy
-# traces.jsonl writes.
+# traces.jsonl writes. MADAGENTS_TOOL_REPEAT_LIMIT tunes the vLLM runtime's
+# repetition watchdog.
 # NOTE: any future APPTAINERENV_* line MUST use `${VAR:-}` because of
 # `set -u` at line 2.
 export APPTAINERENV_MADAGENTS_VLLM_SEED="${MADAGENTS_VLLM_SEED:-}"
 export APPTAINERENV_MADAGENTS_TRIAL_ID="${MADAGENTS_TRIAL_ID:-}"
 export APPTAINERENV_MADAGENTS_TOKENIZER_REVISION="${MADAGENTS_TOKENIZER_REVISION:-}"
 export APPTAINERENV__MADAGENTS_ENABLE_TRACE="${_MADAGENTS_ENABLE_TRACE:-}"
+export APPTAINERENV_MADAGENTS_TOOL_REPEAT_LIMIT="${MADAGENTS_TOOL_REPEAT_LIMIT:-}"
 
 # Forward the local-tool env vars (vLLM runtime: SearXNG-backed web_search and
 # docling-backed read_pdf). DOCLING_ARTIFACTS_PATH defaults to the in-overlay
