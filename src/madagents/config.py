@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 from typing import Optional, Dict, List
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+logger = logging.getLogger(__name__)
 
 SUPPORTED_MODELS: List[str] = [
     "gpt-5-nano",
@@ -307,22 +310,39 @@ def _apply_vllm_summarizer_defaults(data: dict) -> None:
     ``vllm_tokens.summarizer_token_threshold``) so it scales with whatever
     model vLLM was started with.
 
-    Tradeoff: this override is unconditional — if a caller explicitly writes
-    ``agents.summarizer.token_threshold`` in their config for a vLLM
-    deployment, it is silently replaced.  We accept that loss of caller
-    intent because (a) the 150 K API-provider default collides with any
-    value a user might reasonably type, making "explicit vs. inherited"
-    indistinguishable post-Pydantic-validation, and (b) no current caller
-    sets this field for vLLM.  Users who need a custom trigger should tune
-    ``MAX_MODEL_LEN`` or ``vllm_tokens.VLLM_SUMMARIZER_THRESHOLD_CEILING``
-    instead.
-    """
-    from madagents.llm.vllm_tokens import summarizer_token_threshold
+    The gate protects every agent's history, not the summarizer's own
+    context, so any vLLM-backed agent triggers the derivation even when the
+    summarizer itself runs on an API provider.
 
-    summarizer = data.get("agents", {}).get("summarizer") or {}
-    if summarizer.get("provider") != "vllm":
+    Tradeoff: the override is unconditional.  A threshold written in the
+    config, including one persisted in ``runs.sqlite``, is replaced, because
+    a stored value does not follow the ``MAX_MODEL_LEN`` it was derived from:
+    one above the current window makes the gate fire only after the prompt
+    has already overshot, if at all.
+    """
+    from madagents.llm.vllm_tokens import MAX_MODEL_LEN, summarizer_token_threshold
+
+    agents = data.get("agents") or {}
+    summarizer = agents.get("summarizer") or {}
+    providers = {
+        str(agent.get("provider") or "").strip().lower()
+        or infer_provider_from_model(agent.get("model"))
+        for agent in agents.values()
+        if isinstance(agent, dict)
+    }
+    if "vllm" not in providers:
         return
-    summarizer["token_threshold"] = summarizer_token_threshold()
+    derived = summarizer_token_threshold()
+    stored = summarizer.get("token_threshold")
+    if stored not in (None, derived, DEFAULT_SUMMARIZER_TOKEN_THRESHOLD):
+        logger.warning(
+            "summarizer: replacing the stored token_threshold %s with the "
+            "runtime-derived %d (MAX_MODEL_LEN=%d).",
+            stored,
+            derived,
+            MAX_MODEL_LEN,
+        )
+    summarizer["token_threshold"] = derived
 
 
 def apply_global_overrides(
@@ -353,7 +373,11 @@ def apply_global_overrides(
 
 
 def coerce_config(payload: Optional[dict]) -> MadAgentsConfig:
-    """Coerce a loose dict payload into a validated MadAgentsConfig."""
+    """Coerce a loose dict payload into a validated MadAgentsConfig.
+
+    A vLLM summarizer threshold is re-derived from the runtime, so a value
+    persisted under a different ``MAX_MODEL_LEN`` cannot outlive it.
+    """
     base = default_config()
     if not isinstance(payload, dict):
         return base
@@ -393,4 +417,5 @@ def coerce_config(payload: Optional[dict]) -> MadAgentsConfig:
                 # Ensure step_limit is cleared for unsupported agents.
                 data["agents"][name]["step_limit"] = None
 
+    _apply_vllm_summarizer_defaults(data)
     return MadAgentsConfig.model_validate(data)

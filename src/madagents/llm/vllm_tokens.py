@@ -19,6 +19,11 @@ Approach
    raise ``RuntimeError`` rather than silently truncate. This should never
    happen if the summarizer fires at the configured threshold.
 
+``MAX_MODEL_LEN`` is fixed at import (env override, 65536 default) and
+checked once, at runtime construction, against the window the server's
+``/v1/models`` card reports (``check_served_window``): claiming more than
+the server serves is a hard error.
+
 The HTTP round-trip to ``/tokenize`` adds ~3-15 ms per invocation on a
 loopback path, well below the inference latency of the call it guards.
 """
@@ -56,14 +61,12 @@ VLLM_DEFAULT_MAX_OUTPUT: int = 4096
 # Floor below which we refuse to invoke — summarizer should have fired.
 VLLM_MIN_OUTPUT: int = 1024
 
-# Reserved output budget for the summarizer when it fires. The trigger threshold
-# in ``config._apply_vllm_summarizer_defaults`` is ``MAX_MODEL_LEN -
-# VLLM_MAX_SUMMARIZER_OUTPUT``, so when the conversation reaches the trigger
-# there is this much room left in the context window for the summarizer to write
-# its summary. It does not, by itself, prevent a single oversized tool result
-# from overflowing the window when the summarizer cannot shrink the prompt; that
-# preserved-tail case is caught by the dynamic-max backstop in
-# ``compute_dynamic_max_tokens``.
+# Reserved output budget for the summarizer when it fires: the room the summary
+# itself needs once the conversation reaches the trigger. Sized at about twice
+# the largest summary observed in practice. It does not, by itself, prevent a
+# single oversized tool result from overflowing the window when the summarizer
+# cannot shrink the prompt; that preserved-tail case is caught by the
+# dynamic-max backstop in ``compute_dynamic_max_tokens``.
 VLLM_MAX_SUMMARIZER_OUTPUT: int = int(os.environ.get("VLLM_MAX_SUMMARIZER_OUTPUT", "3072"))
 
 # Per-agent ceilings. Use ``None`` to let an agent consume all remaining
@@ -72,6 +75,25 @@ VLLM_MAX_SUMMARIZER_OUTPUT: int = int(os.environ.get("VLLM_MAX_SUMMARIZER_OUTPUT
 VLLM_AGENT_OUTPUT_CEILINGS: dict[str, int | None] = {
     "summarizer": None,
 }
+
+
+def _reserved_output_tokens() -> int:
+    """Output budget the summarizer gate reserves below ``MAX_MODEL_LEN``.
+
+    The gate must leave room for whichever is larger: the summary written
+    when it fires, or the completion of an agent admitted just under it,
+    which the exact path would otherwise clip below its ceiling and the
+    tokenizer-less path would let overflow. ``None`` ceilings are excluded
+    (they mean "use whatever the window has left", which the gate itself
+    bounds); agents without an entry get ``VLLM_DEFAULT_MAX_OUTPUT``.
+    """
+    bounded = [
+        ceiling
+        for ceiling in VLLM_AGENT_OUTPUT_CEILINGS.values()
+        if ceiling is not None
+    ]
+    return max([VLLM_MAX_SUMMARIZER_OUTPUT, VLLM_DEFAULT_MAX_OUTPUT, *bounded])
+
 
 # Module-load invariants on the constants above. Wrapped in functions so
 # they can be exercised from unit tests with monkey-patched constants.
@@ -104,23 +126,88 @@ def _check_agent_output_ceilings() -> None:
             )
 
 
-def _check_summarizer_output_within_window() -> None:
-    """The reserve must be a positive fraction of the context window. Otherwise
-    the derived threshold ``MAX_MODEL_LEN - VLLM_MAX_SUMMARIZER_OUTPUT`` is <= 0
-    (the gate fires every turn) or >= MAX_MODEL_LEN (the gate never fires). This
-    guards a misconfigured ``VLLM_MAX_SUMMARIZER_OUTPUT`` env override.
+def _check_reserved_budget_within_window() -> None:
+    """The reserved budget must leave prompt room inside the window.
+
+    At or above ``MAX_MODEL_LEN`` the derived threshold is <= 0 and the gate
+    fires on every turn. Positivity needs no guard: the reserve is maxed
+    with the ``VLLM_DEFAULT_MAX_OUTPUT`` source constant.
     """
-    if not 0 < VLLM_MAX_SUMMARIZER_OUTPUT < MAX_MODEL_LEN:
+    reserved = _reserved_output_tokens()
+    if reserved >= MAX_MODEL_LEN:
         raise RuntimeError(
-            f"vllm_tokens misconfigured: VLLM_MAX_SUMMARIZER_OUTPUT "
-            f"({VLLM_MAX_SUMMARIZER_OUTPUT}) must be in the open interval "
-            f"(0, MAX_MODEL_LEN={MAX_MODEL_LEN})."
+            f"vllm_tokens misconfigured: the reserved output budget "
+            f"({reserved}) must be below MAX_MODEL_LEN={MAX_MODEL_LEN}."
         )
 
 
 _check_min_output_below_summarizer_output()
 _check_agent_output_ceilings()
-_check_summarizer_output_within_window()
+_check_reserved_budget_within_window()
+
+
+@functools.lru_cache(maxsize=8)
+def model_card(served_name: str, base_url: str) -> dict[str, Any]:
+    """The server's ``/v1/models`` card for ``served_name``.
+
+    Raises rather than guessing: the wrong card means the wrong model family
+    and the wrong window. Failures are not memoized, so a probe that races
+    the server coming up can succeed later.
+    """
+    req = urllib.request.Request(
+        f"{base_url}/models",
+        headers={"Authorization": f"Bearer {os.environ.get('VLLM_API_KEY', 'dummy')}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            cards = json.load(resp).get("data", [])
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Cannot read the model card for {served_name!r}: "
+            f"GET {base_url}/models failed ({exc}). The vLLM server must be "
+            f"reachable when the runtime starts."
+        ) from exc
+    for card in cards:
+        if card.get("id") == served_name:
+            return card
+    raise RuntimeError(
+        f"No model card for {served_name!r} at {base_url} "
+        f"(available: {[c.get('id') for c in cards]}). The name must "
+        f"exactly match a served model, a loaded adapter, or an adapter "
+        f"card's parent."
+    )
+
+
+def check_served_window(base_card: dict[str, Any]) -> None:
+    """Check ``MAX_MODEL_LEN`` against the window the server actually serves.
+
+    The card is authoritative: a claim above its ``max_model_len`` puts the
+    summarizer gate past the real limit, so that is a hard error. A claim
+    below it gates earlier than the server requires, usually a stale export,
+    so it is warned. A card without the field (hosted gateways) leaves the
+    claim unchecked, with a warning.
+    """
+    served = base_card.get("max_model_len")
+    if not served:
+        logger.warning(
+            "vllm_tokens: the card for %r reports no max_model_len. "
+            "MAX_MODEL_LEN=%d stands unchecked.",
+            base_card.get("id"), MAX_MODEL_LEN,
+        )
+        return
+    if MAX_MODEL_LEN > served:
+        raise RuntimeError(
+            f"vllm_tokens: MAX_MODEL_LEN={MAX_MODEL_LEN} exceeds the "
+            f"{served}-token window the server serves. Set MAX_MODEL_LEN "
+            f"to at most {served}, or start the server with a wider window."
+        )
+    if MAX_MODEL_LEN < served:
+        logger.warning(
+            "vllm_tokens: MAX_MODEL_LEN=%d runs below the %d-token window "
+            "the server serves. If the narrowing is not deliberate, "
+            "re-export MAX_MODEL_LEN to match the server.",
+            MAX_MODEL_LEN, served,
+        )
 
 
 def summarizer_token_threshold() -> int:
@@ -132,7 +219,7 @@ def summarizer_token_threshold() -> int:
     ``VLLM_SUMMARIZER_THRESHOLD_CEILING`` for models that degrade before
     their advertised context limit.
     """
-    base = MAX_MODEL_LEN - VLLM_MAX_SUMMARIZER_OUTPUT
+    base = MAX_MODEL_LEN - _reserved_output_tokens()
     if VLLM_SUMMARIZER_THRESHOLD_CEILING is not None:
         return min(base, VLLM_SUMMARIZER_THRESHOLD_CEILING)
     return base

@@ -5,8 +5,6 @@ import json
 import logging
 import os
 import time
-import urllib.error
-import urllib.request
 from collections import Counter
 from typing import Any
 
@@ -81,28 +79,21 @@ def _resolve_base_model_name(served_name: str, base_url: str) -> str:
     The base name is the ``parent`` field of a LoRA adapter's model card, or
     the served name itself for base models. Failure is a hard error: guessing
     a family from an arbitrary adapter name silently picks wrong defaults.
+    Also checks ``MAX_MODEL_LEN`` against the served window on the base
+    card, which is the one that carries it.
     """
-    req = urllib.request.Request(
-        f"{base_url}/models",
-        headers={"Authorization": f"Bearer {os.environ.get('VLLM_API_KEY', 'dummy')}"},
-    )
+    card = vllm_tokens.model_card(served_name, base_url)
+    base_name = card.get("parent") or served_name
+    if base_name != served_name:
+        card = vllm_tokens.model_card(base_name, base_url)
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            cards = json.load(resp).get("data", [])
-    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(
-            f"Cannot resolve the model family of {served_name!r}: "
-            f"GET {base_url}/models failed ({exc}). The vLLM server must be "
-            f"reachable when the runtime starts."
-        ) from exc
-    for card in cards:
-        if card.get("id") == served_name:
-            return card.get("parent") or served_name
-    raise RuntimeError(
-        f"VLLM_MODEL={served_name!r} is not served at {base_url} "
-        f"(available: {[c.get('id') for c in cards]}). It must exactly match "
-        f"a served model or loaded adapter name."
-    )
+        vllm_tokens.check_served_window(card)
+    except RuntimeError:
+        # Evict, or a corrected server would keep failing against the
+        # cached card until the process restarts.
+        vllm_tokens.model_card.cache_clear()
+        raise
+    return base_name
 
 
 def _get_sampling_defaults(base_name: str) -> dict[str, float]:

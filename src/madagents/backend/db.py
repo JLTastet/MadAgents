@@ -4,6 +4,8 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Optional
 
+from pydantic import ValidationError
+
 from madagents.config import (
     MadAgentsConfig,
     apply_global_overrides,
@@ -95,16 +97,14 @@ def load_global_config(
     """Load global config from SQLite, creating a default if missing."""
     ensure_app_config_table(db_path)
     config: Optional[MadAgentsConfig] = None
-    raw: Optional[str] = None
-    try:
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
-            row = conn.execute(
-                "SELECT config_json FROM app_config WHERE key=?",
-                (APP_CONFIG_KEY,),
-            ).fetchone()
-            raw = row[0] if row else None
-    except sqlite3.Error:
-        raw = None
+    # A failed read must propagate: falling through would seed provider
+    # defaults over a row that still exists.
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        row = conn.execute(
+            "SELECT config_json FROM app_config WHERE key=?",
+            (APP_CONFIG_KEY,),
+        ).fetchone()
+    raw = row[0] if row else None
 
     if raw:
         try:
@@ -113,8 +113,8 @@ def load_global_config(
         except json.JSONDecodeError as exc:
             print(f"[config] Failed to parse saved config JSON: {exc}")
             config = None
-        except Exception as exc:
-            print(f"[config] Failed to load saved config: {exc}")
+        except ValidationError as exc:
+            print(f"[config] Saved config failed validation: {exc}")
             config = None
 
     if config is None:
