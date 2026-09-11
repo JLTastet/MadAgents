@@ -18,6 +18,10 @@ Approach
 3. Enforce ``VLLM_MIN_OUTPUT`` as a floor: if the budget falls below it,
    raise ``RuntimeError`` rather than silently truncate. This should never
    happen if the summarizer fires at the configured threshold.
+4. Bound the reasoning of a thinking call to ``max_tokens -
+   VLLM_ANSWER_RESERVE`` (``thinking_budget``; vLLM 0.26 or later with a
+   reasoning parser on the V1 engine), so a turn that reasons up to the
+   ceiling still answers instead of returning empty.
 
 ``MAX_MODEL_LEN`` is fixed at import (env override, 65536 default) and
 checked once, at runtime construction, against the window the server's
@@ -68,6 +72,13 @@ VLLM_MIN_OUTPUT: int = 1024
 # cannot shrink the prompt; that preserved-tail case is caught by the
 # dynamic-max backstop in ``compute_dynamic_max_tokens``.
 VLLM_MAX_SUMMARIZER_OUTPUT: int = int(os.environ.get("VLLM_MAX_SUMMARIZER_OUTPUT", "3072"))
+
+# Output room a thinking call keeps for its answer: vLLM's thinking budget is
+# the call's ``max_tokens`` minus this, so reasoning that runs up to the
+# budget is closed there and the answer still has at least this many tokens.
+# A turn that stops thinking earlier keeps the rest of ``max_tokens`` for its
+# answer. ``0`` disables the budget.
+VLLM_ANSWER_RESERVE: int = int(os.environ.get("VLLM_ANSWER_RESERVE", "1024"))
 
 # Per-agent ceilings. Use ``None`` to let an agent consume all remaining
 # context (e.g. summarizer, whose output can legitimately grow with input).
@@ -141,9 +152,22 @@ def _check_reserved_budget_within_window() -> None:
         )
 
 
+def _check_answer_reserve_below_default_ceiling() -> None:
+    """The answer reserve must leave a positive thinking budget under the
+    default ceiling, or every thinking call would run unbudgeted.
+    """
+    if not 0 <= VLLM_ANSWER_RESERVE < VLLM_DEFAULT_MAX_OUTPUT:
+        raise RuntimeError(
+            f"vllm_tokens misconfigured: VLLM_ANSWER_RESERVE "
+            f"({VLLM_ANSWER_RESERVE}) must be at least 0 and below "
+            f"VLLM_DEFAULT_MAX_OUTPUT ({VLLM_DEFAULT_MAX_OUTPUT})."
+        )
+
+
 _check_min_output_below_summarizer_output()
 _check_agent_output_ceilings()
 _check_reserved_budget_within_window()
+_check_answer_reserve_below_default_ceiling()
 
 
 @functools.lru_cache(maxsize=8)
@@ -608,6 +632,24 @@ def compute_dynamic_max_tokens(
             prompt_tokens, agent_name, summarizer_trigger, dynamic,
         )
     return dynamic
+
+
+def thinking_budget(
+    max_tokens: int, chat_template_kwargs: dict[str, Any],
+) -> int | None:
+    """vLLM's ``thinking_token_budget`` for a call bound to ``max_tokens``.
+
+    ``None`` without vLLM's ``/tokenize`` (the field and the logprobs that
+    reveal a hit are vLLM extensions) and when nothing is left above the
+    reserve; a call squeezed to little more than the reserve gets a small
+    budget and is closed early rather than left to run to the ceiling.
+    """
+    if (not VLLM_ANSWER_RESERVE
+            or chat_template_kwargs.get("enable_thinking") is False
+            or not tokenize_enabled()):
+        return None
+    budget = max_tokens - VLLM_ANSWER_RESERVE
+    return budget if budget > 0 else None
 
 
 # ---------------------------------------------------------------------------

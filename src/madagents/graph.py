@@ -41,6 +41,7 @@ from madagents.utils import (
     extract_output_token_counts,
     extract_thinking,
     extract_token_kwargs,
+    extract_truncation,
     make_summary_fingerprint,
     add_messages_with_token_imputation,
 )
@@ -446,6 +447,9 @@ def get_planner_executor_node(
             display_additional["non_reasoning_output_tokens"] = non_reasoning_output_tokens
         if planner_thinking:
             display_additional["reasoning"] = planner_thinking
+        truncation = extract_truncation(last_ai) if last_ai else None
+        if truncation:
+            display_additional["truncation"] = truncation
         display_response = AIMessage(
             content=f"I have created the following plan:\n{json.dumps(plan, indent=2)}",
             name="planner",
@@ -581,6 +585,9 @@ def get_reviewer_executor_node(
             display_additional["non_reasoning_output_tokens"] = non_reasoning_output_tokens
         if reviewer_thinking:
             display_additional["reasoning"] = reviewer_thinking
+        truncation = extract_truncation(result["messages"][-1])
+        if truncation:
+            display_additional["truncation"] = truncation
         display_response = AIMessage(
             content=reviewer_text,
             name=reviewer_name,

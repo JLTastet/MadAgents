@@ -161,14 +161,41 @@ def extract_thinking(response: AIMessage) -> str:
     return "\n\n".join(parts)
 
 
-def extract_token_kwargs(response: BaseMessage) -> dict[str, int]:
-    """Extract token count fields from a response into a kwargs dict."""
+def extract_truncation(response: BaseMessage) -> str | None:
+    """Why the response was cut short, or ``None`` for a stop the model chose.
+
+    ``"max_tokens"`` when the provider reports its output limit:
+
+    - chat completions: ``finish_reason`` is ``length``;
+    - the OpenAI Responses API: ``incomplete_details.reason`` is
+      ``max_output_tokens``;
+    - Anthropic: ``stop_reason`` is ``max_tokens``.
+
+    A runtime that detects other kinds sets ``additional_kwargs["truncation"]``
+    itself (the vLLM runtime's ``thinking_budget``), which takes precedence.
+    """
+    additional = getattr(response, "additional_kwargs", None) or {}
+    if additional.get("truncation"):
+        return additional["truncation"]
+    metadata = getattr(response, "response_metadata", None) or {}
+    if (metadata.get("finish_reason") == "length"
+            or (metadata.get("incomplete_details") or {}).get("reason") == "max_output_tokens"
+            or metadata.get("stop_reason") == "max_tokens"):
+        return "max_tokens"
+    return None
+
+
+def extract_token_kwargs(response: BaseMessage) -> dict[str, Any]:
+    """Extract token count fields and the truncation marker from a response into a kwargs dict."""
     token_counts = extract_output_token_counts(response) or {}
-    result: dict[str, int] = {}
+    result: dict[str, Any] = {}
     for key in ("non_reasoning_output_tokens", "reasoning_output_tokens", "output_tokens"):
         val = token_counts.get(key)
         if isinstance(val, int):
             result[key] = val
+    truncation = extract_truncation(response)
+    if truncation:
+        result["truncation"] = truncation
     return result
 
 

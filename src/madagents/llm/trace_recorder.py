@@ -31,7 +31,10 @@ logger = logging.getLogger(__name__)
 
 # Schema changelog:
 # * Version 2 added per-call ``sampled_tokens``: the sampler's own token ids
-#   and logprobs, which training checks its own render against.
+#   and logprobs, which training checks its own render against. Later
+#   additions within the version: ``thinking_token_budget`` (the budget bound
+#   on the call, or null) and ``truncation`` (``max_tokens`` or
+#   ``thinking_budget`` for a turn cut short, else null).
 SCHEMA_VERSION = 2
 DEFAULT_LOG_PATH = "/diagnostics/traces.jsonl"
 DROP_STUB_NAME = "trace_recorder_dropped.json"
@@ -264,6 +267,8 @@ class TraceRecorder:
         sampled_tokens: dict[str, Any] | None = None,
         prompt_token_ids: list[int] | None = None,
         dynamic_max_tokens: int,
+        thinking_token_budget: int | None = None,
+        truncation: str | None = None,
         duration_ms: int,
         latched_error: str | None,
     ) -> None:
@@ -294,6 +299,8 @@ class TraceRecorder:
                 sampled_tokens=sampled_tokens,
                 prompt_token_ids=prompt_token_ids,
                 dynamic_max_tokens=dynamic_max_tokens,
+                thinking_token_budget=thinking_token_budget,
+                truncation=truncation,
                 duration_ms=duration_ms,
                 latched_error=latched_error,
             )
@@ -328,6 +335,8 @@ class TraceRecorder:
         sampled_tokens: dict[str, Any] | None = None,
         prompt_token_ids: list[int] | None = None,
         dynamic_max_tokens: int,
+        thinking_token_budget: int | None = None,
+        truncation: str | None = None,
         duration_ms: int,
         latched_error: str | None,
     ) -> None:
@@ -377,6 +386,10 @@ class TraceRecorder:
             "sampled_tokens": sampled_tokens,
             "prompt_token_ids": prompt_token_ids,
             "dynamic_max_tokens": int(dynamic_max_tokens),
+            "thinking_token_budget": (
+                int(thinking_token_budget) if thinking_token_budget is not None else None
+            ),
+            "truncation": truncation,
             "duration_ms": int(duration_ms),
             "latched_error": latched_error,
             "capture_meta_ref": self._meta_ref,

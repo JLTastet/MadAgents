@@ -3,7 +3,7 @@ from typing import Any, Optional, Union
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
-from madagents.utils import response_to_text, _serialize_message
+from madagents.utils import extract_truncation, response_to_text, _serialize_message
 
 #########################################################################
 ## Message helpers ######################################################
@@ -70,6 +70,15 @@ def _message_tool_call_id(msg: Any) -> Optional[str]:
 
 
 def get_add_content(message: BaseMessage):
+    """Wrap ``_add_content`` so a field every branch must carry is added once."""
+    add_content = _add_content(message)
+    truncation = extract_truncation(message)
+    if truncation:
+        add_content["truncation"] = truncation
+    return add_content
+
+
+def _add_content(message: BaseMessage):
     if isinstance(message, AIMessage):
         if message.name == "orchestrator":
             orchestrator_decision = message.additional_kwargs.get("orchestrator_decision")
@@ -277,6 +286,12 @@ def get_exec_trace_messages(agent: str, message: BaseMessage):
             # No tool calls — return thinking blocks only (e.g. final
             # response thinking before the agent reply).
             return thinking_msgs
+        # Mark a cut turn on its first call entry: a turn with tool calls has
+        # no top-level history entry of its own (the worker continued after
+        # the calls).
+        truncation = extract_truncation(message)
+        if truncation and msgs:
+            msgs[0]["add_content"]["truncation"] = truncation
         # Prepend thinking before tool call traces.
         return thinking_msgs + msgs
     elif isinstance(message, ToolMessage):

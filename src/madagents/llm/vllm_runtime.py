@@ -230,6 +230,37 @@ def _extract_sampled_tokens(result: Any) -> dict[str, Any] | None:
     return {"token_ids": token_ids, "logprobs": logprobs}
 
 
+# The decoded text of the token closing a Qwen-style think block, as the
+# logprobs stream reports it (its ``bytes`` field, whatever ``token`` shows).
+_THINK_END_BYTES = list(b"</think>")
+
+
+def _truncation_reason(response_metadata: dict[str, Any], budget: int | None) -> str | None:
+    """Why the generation stopped short of a stop token the model chose.
+
+    - ``"max_tokens"``: the output ceiling ended it (``finish_reason`` is
+      ``length``), inside the reasoning or inside the answer.
+    - ``"thinking_budget"``: vLLM closed the reasoning at the budget. vLLM
+      reports that nowhere, so the forced ``</think>`` is read off the
+      logprobs stream at index ``budget - 1``; an earlier one means the
+      model closed the block itself.
+    - ``None``: a natural stop.
+
+    The index assumes the generation prompt ends with ``<think>`` plus a
+    newline token (the Qwen templates), which vLLM counts as the block's
+    first token; a block the model closes itself at exactly ``budget - 1``
+    is indistinguishable from a forced close.
+    """
+    if response_metadata.get("finish_reason") == "length":
+        return "max_tokens"
+    if budget is None:
+        return None
+    entries = (response_metadata.get("logprobs") or {}).get("content") or []
+    close_indices = [i for i, entry in enumerate(entries[:budget])
+                     if entry.get("bytes") == _THINK_END_BYTES]
+    return "thinking_budget" if close_indices == [budget - 1] else None
+
+
 def _get_existing_bound_max_tokens(llm: Any) -> int | None:
     """Return any ``max_tokens`` already bound on ``llm`` via ``.bind()``.
 
@@ -710,18 +741,24 @@ class VLLMRuntime(LLMRuntime):
                     )
             dynamic_max = caller_max
         bound = llm.bind(max_tokens=dynamic_max)
-        # Only while capturing: the logprobs stream is the sole source of the
-        # tokens the model actually sampled, which importance-sampling
-        # corrections and render-fidelity checks need. It costs roughly one
-        # extra token's worth of record per generated token, so it is on by
-        # default and MADAGENTS_CAPTURE_LOGPROBS=0 opts out where that
-        # compounds (per-call SFT collection over many trials). Skipped
-        # without /tokenize (VLLM_TOKENIZE=0): a server without vLLM's admin
-        # endpoints is not expected to honour the vLLM-specific token-id
-        # extension either.
-        if (vllm_tokens.tokenize_enabled()
-                and os.environ.get("_MADAGENTS_ENABLE_TRACE")
-                and os.environ.get("MADAGENTS_CAPTURE_LOGPROBS", "1") != "0"):
+        budget = vllm_tokens.thinking_budget(dynamic_max, plan["chat_template_kwargs"])
+        if budget is not None:
+            bound = _bind_extra_body(bound, {"thinking_token_budget": budget})
+        # The logprobs stream is the sole source of the tokens the model
+        # actually sampled, which importance-sampling corrections and
+        # render-fidelity checks need, and the only evidence of a budget hit
+        # (vLLM reports none). It costs roughly one extra token's worth of
+        # response per generated token, so it is requested for budgeted calls
+        # and while capturing; MADAGENTS_CAPTURE_LOGPROBS=0 keeps it out of
+        # the record where storing it compounds (per-call SFT collection over
+        # many trials). Skipped without /tokenize (VLLM_TOKENIZE=0): a server
+        # without vLLM's admin endpoints is not expected to honour the
+        # vLLM-specific token-id extension either.
+        capture_logprobs = bool(
+            os.environ.get("_MADAGENTS_ENABLE_TRACE")
+            and os.environ.get("MADAGENTS_CAPTURE_LOGPROBS", "1") != "0"
+        )
+        if vllm_tokens.tokenize_enabled() and (budget is not None or capture_logprobs):
             bound = _bind_extra_body(bound, {"return_tokens_as_token_ids": True})
             bound = bound.bind(logprobs=True)
 
@@ -755,6 +792,33 @@ class VLLMRuntime(LLMRuntime):
                 plan["prompt_tokens_vllm"], response_input_tokens,
             )
 
+        metadata = getattr(result, "response_metadata", None) or {}
+        entries = (metadata.get("logprobs") or {}).get("content") or []
+        if budget is not None and not entries:
+            logger.warning(
+                "vllm_runtime: a thinking budget was bound but the response "
+                "carries no logprobs stream (agent=%s); budget hits cannot be "
+                "detected on this server", agent_name,
+            )
+        truncation = _truncation_reason(metadata, budget)
+        sampled = _extract_sampled_tokens(result) if capture_logprobs else None
+        if not capture_logprobs:
+            # Requested only for the detection above: nothing stores the
+            # stream, and it would bloat the checkpointed message.
+            metadata.pop("logprobs", None)
+        if truncation:
+            # The marker travels with the message into the exported history
+            # (the rubric prices it) and into the training record (the
+            # trainer masks the turn).
+            result.additional_kwargs["truncation"] = truncation
+            logger.warning(
+                "vllm_runtime: turn cut (%s) trial_id=%s agent=%s "
+                "output_tokens=%s max_tokens=%d thinking_budget=%s",
+                truncation, os.environ.get("MADAGENTS_TRIAL_ID"), agent_name,
+                usage.get("output_tokens") if isinstance(usage, dict) else None,
+                dynamic_max, budget,
+            )
+
         # _MADAGENTS_ENABLE_TRACE is set by the benchmark runner; users opt
         # in via the --capture-traces CLI flag.
         if os.environ.get("_MADAGENTS_ENABLE_TRACE"):
@@ -767,18 +831,28 @@ class VLLMRuntime(LLMRuntime):
                 prompt_tokens_vllm=plan["prompt_tokens_vllm"],
                 output_message=result,
                 usage_metadata=usage if isinstance(usage, dict) else None,
-                response_metadata=getattr(result, "response_metadata", None),
+                response_metadata=metadata,
                 sampling_params=sampling_params,
-                sampled_tokens=_extract_sampled_tokens(result),
+                sampled_tokens=sampled,
                 # Same opt-out as the logprobs: these are the larger
                 # contributor, since each call stores its whole prompt.
-                prompt_token_ids=(
-                    plan["prompt_token_ids"]
-                    if os.environ.get("MADAGENTS_CAPTURE_LOGPROBS", "1") != "0"
-                    else None),
+                prompt_token_ids=plan["prompt_token_ids"] if capture_logprobs else None,
                 dynamic_max_tokens=dynamic_max,
+                thinking_token_budget=budget,
+                truncation=truncation,
                 duration_ms=duration_ms,
                 latched_error=latched_error,
+            )
+        if (budget is not None and truncation == "max_tokens" and entries
+                and not any(entry.get("bytes") == _THINK_END_BYTES for entry in entries)):
+            # An enforced budget closes the block before the ceiling, so a
+            # ceiling cut with no close means the server ignored the field.
+            raise RuntimeError(
+                f"vllm_runtime: the server did not enforce "
+                f"thinking_token_budget={budget}: agent={agent_name} reasoned up "
+                f"to max_tokens={dynamic_max} without a </think>. The budget needs "
+                f"vLLM 0.26 or later with a reasoning parser on the V1 engine; "
+                f"set VLLM_ANSWER_RESERVE=0 to run without it."
             )
         self._check_tool_repeats(result, agent_name)
         return result
